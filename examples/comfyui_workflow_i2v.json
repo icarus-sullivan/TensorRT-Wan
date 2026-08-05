@@ -1,0 +1,213 @@
+{
+  "id": "trtwan-i2v-example",
+  "revision": 0,
+  "last_node_id": 12,
+  "last_link_id": 13,
+  "nodes": [
+    {
+      "id": 100,
+      "type": "Note",
+      "pos": [-200, -420],
+      "size": [520, 220],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "TensorRT-Wan example I2V graph.\n\nWon't run yet: TensorRT Wan Loader needs a built model_dir (wan_model.json + 4 .engine files) via `trtwan build engine` - none exist until you write a --loader for your checkpoint and export/build (see docs/export.md, docs/engine_generation.md).\n\nKnown gaps vs a full workflow:\n- No negative-prompt input. CFG nulls the text embedding internally (engine/dit_engine.py _null_conditioning) instead of taking a separate negative CONDITIONING.\n- No Wan2.2 MoE (high/low expert switch) support - single DiTEngine only.\n- EmptyLatentImage is a 4D placeholder; TensorRT-Wan expects 5D (B,C,T,H,W) latents. Wire in whatever 5D empty-video-latent node your ComfyUI build has (e.g. WanImageToVideo, used for its LATENT output only) instead."
+      ],
+      "color": "#432",
+      "bgcolor": "#321"
+    },
+    {
+      "id": 1,
+      "type": "LoadImage",
+      "pos": [-200, 150],
+      "size": [270, 314],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        { "name": "IMAGE", "type": "IMAGE", "links": [1] },
+        { "name": "MASK", "type": "MASK", "links": null }
+      ],
+      "properties": { "Node name for S&R": "LoadImage" },
+      "widgets_values": ["example.png", "image"]
+    },
+    {
+      "id": 2,
+      "type": "TensorRTRuntimeManager",
+      "pos": [-200, 550],
+      "size": [320, 100],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{ "name": "runtime", "type": "TRTWAN_RUNTIME", "links": [2] }],
+      "properties": { "Node name for S&R": "TensorRTRuntimeManager" },
+      "widgets_values": ["auto", "~/.cache/tensorrt_wan/engines"]
+    },
+    {
+      "id": 3,
+      "type": "TensorRTWanLoader",
+      "pos": [150, 550],
+      "size": [320, 140],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [{ "name": "runtime", "type": "TRTWAN_RUNTIME", "link": 2 }],
+      "outputs": [
+        { "name": "model_config", "type": "TRTWAN_MODEL_CONFIG", "links": null },
+        { "name": "text_encoder", "type": "TRTWAN_TEXT_ENCODER_ENGINE", "links": [3] },
+        { "name": "dit", "type": "TRTWAN_DIT_ENGINE", "links": [7] },
+        { "name": "vae_encoder", "type": "TRTWAN_VAE_ENCODER_ENGINE", "links": [4] },
+        { "name": "vae_decoder", "type": "TRTWAN_VAE_DECODER_ENGINE", "links": [11] }
+      ],
+      "properties": { "Node name for S&R": "TensorRTWanLoader" },
+      "widgets_values": ["/workspace/runpod-slim/models/wan2.1-t2v-14b-trt"]
+    },
+    {
+      "id": 4,
+      "type": "TensorRTTextEncoder",
+      "pos": [550, 350],
+      "size": [320, 150],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [{ "name": "text_encoder", "type": "TRTWAN_TEXT_ENCODER_ENGINE", "link": 3 }],
+      "outputs": [{ "name": "conditioning", "type": "TRTWAN_COND_INPUT", "links": [5] }],
+      "properties": { "Node name for S&R": "TensorRTTextEncoder" },
+      "widgets_values": ["a fox running through a snowy forest, cinematic lighting"]
+    },
+    {
+      "id": 5,
+      "type": "TensorRTVAEEncoder",
+      "pos": [550, 550],
+      "size": [320, 110],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        { "name": "vae_encoder", "type": "TRTWAN_VAE_ENCODER_ENGINE", "link": 4 },
+        { "name": "image", "type": "IMAGE", "link": 1 }
+      ],
+      "outputs": [{ "name": "conditioning", "type": "TRTWAN_COND_INPUT", "links": [6] }],
+      "properties": { "Node name for S&R": "TensorRTVAEEncoder" },
+      "widgets_values": ["first_frame"]
+    },
+    {
+      "id": 6,
+      "type": "TensorRTConditioningManager",
+      "pos": [950, 400],
+      "size": [280, 170],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        { "name": "text", "type": "TRTWAN_COND_INPUT", "link": 5 },
+        { "name": "image", "type": "TRTWAN_COND_INPUT", "link": 6 },
+        { "name": "control", "type": "TRTWAN_COND_INPUT", "link": null },
+        { "name": "ip_adapter", "type": "TRTWAN_COND_INPUT", "link": null },
+        { "name": "lora", "type": "TRTWAN_COND_INPUT", "link": null }
+      ],
+      "outputs": [{ "name": "conditioning", "type": "TRTWAN_UNIFIED_CONDITIONING", "links": [8] }],
+      "properties": { "Node name for S&R": "TensorRTConditioningManager" },
+      "widgets_values": []
+    },
+    {
+      "id": 7,
+      "type": "TensorRTScheduler",
+      "pos": [950, 620],
+      "size": [280, 60],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{ "name": "scheduler", "type": "TRTWAN_SCHEDULER", "links": [9] }],
+      "properties": { "Node name for S&R": "TensorRTScheduler" },
+      "widgets_values": [5.0]
+    },
+    {
+      "id": 8,
+      "type": "EmptyLatentImage",
+      "pos": [950, 730],
+      "size": [280, 106],
+      "flags": {},
+      "order": 8,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [{ "name": "LATENT", "type": "LATENT", "links": [10] }],
+      "properties": { "Node name for S&R": "EmptyLatentImage" },
+      "widgets_values": [832, 480, 1]
+    },
+    {
+      "id": 9,
+      "type": "TensorRTSampler",
+      "pos": [1300, 450],
+      "size": [300, 200],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        { "name": "dit", "type": "TRTWAN_DIT_ENGINE", "link": 7 },
+        { "name": "conditioning", "type": "TRTWAN_UNIFIED_CONDITIONING", "link": 8 },
+        { "name": "scheduler", "type": "TRTWAN_SCHEDULER", "link": 9 },
+        { "name": "latent", "type": "LATENT", "link": 10 }
+      ],
+      "outputs": [{ "name": "latent", "type": "LATENT", "links": [12] }],
+      "properties": { "Node name for S&R": "TensorRTSampler" },
+      "widgets_values": [30, 5.0, 0]
+    },
+    {
+      "id": 10,
+      "type": "TensorRTVAEDecoder",
+      "pos": [1650, 450],
+      "size": [280, 80],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        { "name": "vae_decoder", "type": "TRTWAN_VAE_DECODER_ENGINE", "link": 11 },
+        { "name": "latent", "type": "LATENT", "link": 12 }
+      ],
+      "outputs": [{ "name": "image", "type": "IMAGE", "links": [13] }],
+      "properties": { "Node name for S&R": "TensorRTVAEDecoder" },
+      "widgets_values": []
+    },
+    {
+      "id": 11,
+      "type": "SaveImage",
+      "pos": [1980, 450],
+      "size": [280, 320],
+      "flags": {},
+      "order": 11,
+      "mode": 0,
+      "inputs": [{ "name": "images", "type": "IMAGE", "link": 13 }],
+      "outputs": [],
+      "properties": { "Node name for S&R": "SaveImage" },
+      "widgets_values": ["trtwan_output"]
+    }
+  ],
+  "links": [
+    [1, 1, 0, 5, 1, "IMAGE"],
+    [2, 2, 0, 3, 0, "TRTWAN_RUNTIME"],
+    [3, 3, 1, 4, 0, "TRTWAN_TEXT_ENCODER_ENGINE"],
+    [4, 3, 3, 5, 0, "TRTWAN_VAE_ENCODER_ENGINE"],
+    [5, 4, 0, 6, 0, "TRTWAN_COND_INPUT"],
+    [6, 5, 0, 6, 1, "TRTWAN_COND_INPUT"],
+    [7, 3, 2, 9, 0, "TRTWAN_DIT_ENGINE"],
+    [8, 6, 0, 9, 1, "TRTWAN_UNIFIED_CONDITIONING"],
+    [9, 7, 0, 9, 2, "TRTWAN_SCHEDULER"],
+    [10, 8, 0, 9, 3, "LATENT"],
+    [11, 3, 4, 10, 0, "TRTWAN_VAE_DECODER_ENGINE"],
+    [12, 9, 0, 10, 1, "LATENT"],
+    [13, 10, 0, 11, 0, "IMAGE"]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

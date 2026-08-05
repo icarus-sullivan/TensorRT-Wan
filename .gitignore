@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Generated artifacts (never committed — produced by export/build pipeline at runtime)
+*.onnx
+*.engine
+*.plan
+*.trt
+/engines/
+/cache/
+/.trtwan_cache/
+
+# CUDA/TensorRT plugin build output
+plugins/csrc/**/*.o
+plugins/csrc/**/*.so
+plugins/csrc/**/build/
+
+.DS_Store
+.idea/
+.vscode/
+*.log
