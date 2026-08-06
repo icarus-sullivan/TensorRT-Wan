@@ -72,6 +72,7 @@ def run_engine(args: argparse.Namespace) -> int:
     ).is_file() else hashlib.sha256(args.checkpoint.encode()).hexdigest()[:16]
 
     cache_key = CacheKey(
+        component=exporter.name,
         model_hash=model_hash,
         tensorrt_version=runtime.tensorrt.version or "unknown",
         cuda_version=gpu.cuda_version or "unknown",

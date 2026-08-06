@@ -23,8 +23,14 @@ class VAEEncoderEngine:
         self._wrapper.load()
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        """`image`: (B, C, H, W) in [-1, 1]. Returns a single-frame latent."""
-        return self._wrapper.infer({"pixels": image})["latent"]
+        """`image`: (B, C, H, W) in [-1, 1]. Returns a single-frame latent, (B, C_latent, 1, h, w).
+
+        Unsqueezed to (B, C, 1, H, W) before inference: the built engine's `pixels` input is
+        always rank-5 (see `export/exporters/vae.py`'s `VAEEncoderExporter` — one engine handles
+        both single-image and full-video encoding via a dynamic frame axis, T=1 for an image
+        rather than a separate rank-4 engine).
+        """
+        return self._wrapper.infer({"pixels": image.unsqueeze(2)})["latent"]
 
     def encode_video(self, frames: torch.Tensor) -> torch.Tensor:
         """`frames`: (B, C, T, H, W) in [-1, 1]. Returns the full video latent."""

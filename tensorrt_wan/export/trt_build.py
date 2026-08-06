@@ -81,12 +81,23 @@ def _validate_precision(network: "trt.INetworkDefinition", precision: PrecisionM
     function can fix — it fails loudly instead of silently building the wrong-precision engine.
     `precision="auto"` is never passed here; callers resolve it to a concrete value first (see
     `runtime.precision.select_precision`), so every entry in the map above is checked exactly.
+
+    Only floating-point inputs are checked. Confirmed necessary against a real build: the text
+    encoder's `input_ids`/`attention_mask` are legitimately `INT64` token/mask tensors — Wan never
+    casts those to fp16 (nor should it; they're indices and a 0/1 mask, not activations), so
+    enforcing `precision` against them isn't "an upstream export bug" the way a wrong-dtype
+    *activation* tensor would be, it's just comparing the wrong kind of value. Non-float dtypes
+    (int/bool) are skipped entirely rather than being held to a float precision they were never
+    meant to have.
     """
     import tensorrt as trt
 
     expected = getattr(trt.DataType, _PRECISION_TO_DTYPE_NAME[precision])
+    float_dtypes = {getattr(trt.DataType, name) for name in _PRECISION_TO_DTYPE_NAME.values()}
     for i in range(network.num_inputs):
         tensor = network.get_input(i)
+        if tensor.dtype not in float_dtypes:
+            continue
         if tensor.dtype != expected:
             raise RuntimeError(
                 f"Requested precision={precision!r} ({expected}) but ONNX input {tensor.name!r} "

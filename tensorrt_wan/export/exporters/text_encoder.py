@@ -25,7 +25,14 @@ class TextEncoderExporter(ModelExporter):
         }
 
     def dynamic_axes(self) -> dict[str, list[DynamicAxis]]:
-        seq_axis = [DynamicAxis(name="dim0", min=1, opt=1, max=8), DynamicAxis(name="dim1", min=1, opt=self.max_tokens, max=self.max_tokens)]
+        # Batch (dim0) deliberately omitted, same finding as DiTExporter.dynamic_axes(): a real
+        # TensorRT build failed with "Dimension mismatch ... profile has min=1,opt=1,max=8 but
+        # tensor has 1" — torch.export specializes this model's batch dim to a fixed value
+        # regardless of Dim.AUTO (confirmed by the exporter's own "0/1 specialized" warning at
+        # export time), so declaring a profile range for a dimension the ONNX graph doesn't
+        # actually mark dynamic makes the builder reject the profile outright. See
+        # docs/wan2.2_i2v_14b_notes.md.
+        seq_axis = [DynamicAxis(name="dim1", min=1, opt=self.max_tokens, max=self.max_tokens)]
         return {"input_ids": seq_axis, "attention_mask": seq_axis}
 
     @property

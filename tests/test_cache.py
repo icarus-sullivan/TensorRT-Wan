@@ -5,6 +5,7 @@ from tensorrt_wan.runtime.cache import CacheKey, EngineCache
 
 def _key(**overrides) -> CacheKey:
     defaults = dict(
+        component="dit",
         model_hash="abc123",
         tensorrt_version="10.0",
         cuda_version="12.4",
@@ -34,6 +35,16 @@ def test_different_precision_is_a_different_cache_entry(tmp_path: Path):
     cache = EngineCache(tmp_path)
     cache.put(_key(precision="fp16"), b"fp16-engine")
     assert cache.get(_key(precision="fp8")) is None
+
+
+def test_different_component_is_a_different_cache_entry(tmp_path: Path):
+    # Regression test: vae_encoder/vae_decoder share one checkpoint file (same model_hash) and
+    # can share profile/precision too -- without `component` in the key, a decoder build would
+    # silently be served the encoder's cached engine. Confirmed as a real bug on RunPod hardware
+    # before `component` was added; see docs/wan2.2_i2v_14b_notes.md.
+    cache = EngineCache(tmp_path)
+    cache.put(_key(component="vae_encoder"), b"encoder-engine")
+    assert cache.get(_key(component="vae_decoder")) is None
 
 
 def test_clear_removes_all_entries(tmp_path: Path):

@@ -3,12 +3,17 @@
 // Inputs:  x (B, H, S, D), cos (S, D), sin (S, D)
 // Output:  x_rotated (B, H, S, D), same dtype/shape as x
 //
-// Uses the standard "rotate-half" formulation (RoFormer / DiT convention): split the last
-// dimension in half as [x1, x2], output = [x1*cos1 - x2*sin1, x2*cos2 + x1*sin2]. This matches
-// the RoPE convention used across the DiT/Wan model family; validate numerically against the
-// PyTorch reference during the RunPod op-parity phase (docs/plugins.md) before trusting it in a
-// built engine — Wan-specific interleaving (rotate-half vs. rotate-every-two) is not verified
-// against upstream source in this environment.
+// Uses Wan's actual convention: interleaved-pair rotation, confirmed against
+// `comfy/ldm/flux/math.py`'s `_apply_rope1` (cloned in
+// examples/loaders/wan_comfyui_loader.py) — NOT the "rotate-half" split-first-half/
+// second-half convention this kernel implemented previously. Each pair of *adjacent*
+// elements (x[2i], x[2i+1]) is rotated together by a single angle:
+//   out[2i]   = x[2i]*cos_i - x[2i+1]*sin_i
+//   out[2i+1] = x[2i]*sin_i + x[2i+1]*cos_i
+// `cos`/`sin` must be pre-duplicated per pair (cos[2i] == cos[2i+1] == cos_i) — i.e.
+// repeat-interleaved, not concat-duplicated (concat-duplicate is the rotate-half table
+// layout). Still needs numerical validation against the PyTorch reference during the
+// RunPod op-parity phase (docs/plugins.md).
 #pragma once
 
 #include "common/plugin_base.h"

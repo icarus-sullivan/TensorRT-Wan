@@ -43,16 +43,26 @@ def export_to_torch_export(exporter: ModelExporter) -> torch.export.ExportedProg
     )
 
 
-def _build_dynamic_shapes(exporter: ModelExporter) -> dict[str, dict[int, object]]:
-    dynamic_shapes: dict[str, dict[int, object]] = {}
-    for input_name, axes in exporter.dynamic_axes().items():
-        example = exporter.example_inputs()[input_name]
+def _build_dynamic_shapes(exporter: ModelExporter) -> dict[str, dict[int, object] | None]:
+    """One entry per `example_inputs()` kwarg, not just the ones with dynamic axes.
+
+    Confirmed necessary against a real `torch.export` run on torch 2.10.0 (newer than whatever
+    version this was originally written against): passing `dynamic_shapes` as a dict now requires
+    its top-level keys to exactly match every arg name in `kwargs`, not just the dynamic-axis
+    subset — `torch._dynamo.exc.UserError: ... top-level keys must be the arg names [...] of
+    `inputs`, but here they are [...]`. Inputs with no dynamic axes (e.g. `timestep`/`context`,
+    fully static once batch specializes — see `export_to_torch_export`'s docstring) get `None`
+    rather than being omitted.
+    """
+    example_inputs = exporter.example_inputs()
+    axes_by_input = exporter.dynamic_axes()
+    dynamic_shapes: dict[str, dict[int, object] | None] = {}
+    for input_name, example in example_inputs.items():
         dims: dict[int, object] = {}
-        for axis in axes:
+        for axis in axes_by_input.get(input_name, []):
             dim_index = _resolve_axis_index(example, axis.name)
             dims[dim_index] = torch.export.Dim.AUTO
-        if dims:
-            dynamic_shapes[input_name] = dims
+        dynamic_shapes[input_name] = dims or None
     return dynamic_shapes
 
 

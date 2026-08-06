@@ -27,11 +27,18 @@ _NULL_TOKEN_KEY = "text"  # conditioning key classifier-free guidance nulls out 
 # on real Wan 2.2 hardware (see docs/wan2.2_i2v_14b_notes.md); "text" -> "context" is not a
 # cosmetic rename, the engine's I/O tensor is literally named "context".
 #
-# Only "text" is mapped: Wan channel-concatenates image-latent + mask into `x` itself before
-# patch embedding rather than passing them as separate cross-attention tensors (see the same
-# notes doc's conditioning-mismatch section) — there's no engine input name for "image"/"control"/
-# etc. to map to yet. _build_inputs raises rather than silently dropping those below.
+# Only "text" is mapped here: "first_frame"/"last_frame" are channel-concatenated into `x` itself
+# (handled by _concat_image_conditioning below), not passed as separate engine inputs — there's no
+# engine input name for those, or for "control"/"ip_adapter", to map to. _build_inputs raises for
+# anything left over that isn't one of those two cases.
 _ENGINE_INPUT_NAME_BY_EMBEDDING_KEY = {"text": "context"}
+
+# Which side of the temporal axis each image-conditioning kind occupies once concatenated into
+# `x` — confirmed channel order is noise(16) ++ mask(4) ++ image_latent(16), verified directly
+# against ComfyUI's `WAN21.concat_cond` (comfy/model_base.py), see _concat_image_conditioning's
+# docstring; which *temporal* frame index each kind conditions is the obvious reading of the
+# kind's name, not independently confirmed against ComfyUI source.
+_IMAGE_CONDITIONING_FRAME_INDEX = {"first_frame": 0, "last_frame": -1}
 
 
 class DiTEngine:
@@ -111,23 +118,91 @@ class DiTEngine:
         timestep: torch.Tensor,
         conditioning: UnifiedConditioning,
     ) -> dict[str, torch.Tensor]:
-        unsupported = set(conditioning.embeddings) - set(_ENGINE_INPUT_NAME_BY_EMBEDDING_KEY)
+        embeddings = dict(conditioning.embeddings)
+
+        image_kinds = {
+            kind: embeddings.pop(kind) for kind in _IMAGE_CONDITIONING_FRAME_INDEX if kind in embeddings
+        }
+        x = _concat_image_conditioning(latents, image_kinds) if image_kinds else latents
+
+        unsupported = set(embeddings) - set(_ENGINE_INPUT_NAME_BY_EMBEDDING_KEY)
         if unsupported:
             raise NotImplementedError(
                 f"DiTEngine cannot route conditioning kind(s) {sorted(unsupported)} into engine "
-                "inputs yet — Wan channel-concatenates image/mask conditioning into `x` before "
-                "patch embedding rather than passing it as a separate tensor, and that "
-                "concatenation isn't implemented (see docs/wan2.2_i2v_14b_notes.md). Only "
-                "text-only (T2V) conditioning is currently supported."
+                "inputs yet — only text (cross-attention) and first_frame/last_frame "
+                "(channel-concatenated into `x`) are wired up so far."
             )
 
-        inputs = {"x": latents, "timestep": timestep}
+        # DiTExporter.example_inputs() declared `timestep` as rank-1 (shape (1,)), but
+        # SchedulerState.current_timestep (scheduler/state.py) returns a 0-d scalar
+        # (`self.timesteps[self.step_index]`, indexing a 1-d tensor with a plain int). Confirmed
+        # as a real bug via a real generation run: TensorRT's `set_input_shape` rejected the 0-d
+        # tensor with "engineDims.nbDims == dims.nbDims" on every DiT call, and
+        # `TensorRTEngineWrapper._infer_trt` didn't check that call's return value — the engine
+        # silently ran with a stale/wrong timestep binding instead of raising. `.reshape(1)` is a
+        # no-op if `timestep` is already rank-1, so this is safe regardless of scheduler
+        # implementation. See docs/wan2.2_i2v_14b_notes.md.
+        inputs = {"x": x, "timestep": timestep.reshape(1)}
         for embedding_key, engine_name in _ENGINE_INPUT_NAME_BY_EMBEDDING_KEY.items():
-            if embedding_key in conditioning.embeddings:
-                inputs[engine_name] = conditioning.embeddings[embedding_key]
+            if embedding_key in embeddings:
+                inputs[engine_name] = embeddings[embedding_key]
         for key, mask in conditioning.masks.items():
-            inputs[f"{key}_mask"] = mask
+            if key not in _IMAGE_CONDITIONING_FRAME_INDEX:
+                inputs[f"{key}_mask"] = mask
         return inputs
+
+
+def _concat_image_conditioning(x: torch.Tensor, image_kinds: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Channel-concatenates every present image-conditioning kind onto `x`, matching Wan's real
+    `noise(16) ++ mask(4) ++ image_latent(16)` channel layout — confirmed by reading
+    `WAN21.concat_cond` in ComfyUI's own `comfy/model_base.py` directly (`comfy_extras/
+    nodes_wan.py`'s `WanImageToVideo` builds the mask/image separately; `concat_cond` is what
+    actually assembles them: `torch.cat((mask, image), dim=1)`, then concatenated after `noise`).
+    Exactly one 16-channel image_latent slot and one 4-channel mask slot *total*, not one pair
+    per conditioning kind.
+
+    **Real bug, confirmed and fixed:** earlier versions of this function used
+    `noise ++ image_latent ++ mask` order (image before mask) — the reverse of the real layout.
+    Caught via a decisive eager-vs-TensorRT comparison that showed the *engine* matches the real
+    checkpoint almost exactly (cosine_similarity=0.999995) even while end-to-end generation
+    produced incoherent output — meaning the bug had to be in what was fed to the model, not the
+    model/engine itself. Reading `concat_cond` directly settled it: wrong channel order means the
+    model's mask-weight-slice and image-weight-slice were being fed each other's data entirely,
+    which explains the complete lack of coherent structure in every generation attempt. See
+    docs/wan2.2_i2v_14b_notes.md's "Shift sweep and the decisive eager-vs-TensorRT comparison"
+    and the finding that follows it.
+
+    Mask *polarity* was already correct despite looking backwards at a glance: `WanImageToVideo`
+    builds a mask with 0=known/1=to-generate, but `concat_cond` inverts it (`mask = 1.0 - mask`)
+    before concatenating — net result 1=known/0=to-generate, which is what this function already
+    produced. Traced through both stages to confirm rather than assumed.
+
+    Also confirmed via `concat_cond`, still not implemented here: `WanImageToVideo` gray-fills
+    (pixel value 0.5) every frame without a real reference image *before* VAE-encoding the whole
+    padded video in one call, so the "padding" latent frames are whatever the VAE produces for
+    gray input — not zero. This function still zero-pads in latent space directly. Likely a
+    smaller-magnitude discrepancy than the channel-order bug was, but not yet fixed or measured;
+    worth revisiting once the channel-order fix's actual effect on output quality is confirmed.
+
+    `image_kinds`: e.g. `{"first_frame": (B, C_vae, 1, H, W), "last_frame": (B, C_vae, 1, H, W)}`
+    — each value a single encoded frame (`VAEEncoderEngine.encode_image`'s output), not yet
+    expanded to `x`'s full temporal length. All kinds present share one combined image_latent/
+    mask pair, each placed at its own temporal position — e.g. `first_frame` at index 0 and
+    `last_frame` at index -1 simultaneously, both real, only the frames between them zero/gray.
+    """
+    batch, _, num_frames, height, width = x.shape
+    channels = next(iter(image_kinds.values())).shape[1]
+
+    full_image_latent = torch.zeros(batch, channels, num_frames, height, width, device=x.device, dtype=x.dtype)
+    mask = torch.zeros(batch, 4, num_frames, height, width, device=x.device, dtype=x.dtype)
+
+    for kind, image_latent in image_kinds.items():
+        frame_index = _IMAGE_CONDITIONING_FRAME_INDEX[kind]
+        index = frame_index if frame_index >= 0 else num_frames + frame_index
+        full_image_latent[:, :, index] = image_latent[:, :, 0]
+        mask[:, :, index] = 1.0
+
+    return torch.cat([x, mask, full_image_latent], dim=1)
 
 
 def _null_conditioning(conditioning: UnifiedConditioning) -> UnifiedConditioning:

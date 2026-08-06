@@ -43,6 +43,7 @@ def run_export_pipeline(
 
     profile_key = _profiles_digest(resolution_profiles)
     cache_key = CacheKey(
+        component=exporter.name,
         model_hash=model_hash,
         tensorrt_version=runtime.tensorrt.version or "unknown",
         cuda_version=gpu.cuda_version or "unknown",

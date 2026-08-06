@@ -93,8 +93,28 @@ class TensorRTEngineWrapper:
             for i in range(engine.num_io_tensors):
                 name = engine.get_tensor_name(i)
                 if name in inputs:
-                    tensor = inputs[name].to(self.device, non_blocking=True).contiguous()
-                    context.set_input_shape(name, tuple(tensor.shape))
+                    # set_tensor_address hands TensorRT a raw pointer with no dtype conversion —
+                    # if the caller's tensor dtype doesn't match what this input was built with,
+                    # TensorRT reinterprets the same bytes as its own dtype rather than erroring.
+                    # Confirmed as a real bug via a real generation run: FlowMatchEulerScheduler's
+                    # `timestep` is float32 (torch.linspace's default), but the DiT engine's
+                    # `timestep` input was exported as float16 — every element silently became
+                    # byte-garbage, producing NaN on the very first denoising step. Casting to the
+                    # engine's own declared dtype here fixes this generically for every input on
+                    # every engine, not just this one case. See docs/wan2.2_i2v_14b_notes.md.
+                    target_dtype = _trt_dtype_to_torch(engine.get_tensor_dtype(name))
+                    tensor = inputs[name].to(self.device, dtype=target_dtype, non_blocking=True).contiguous()
+                    # set_input_shape returns a bool rather than raising on failure (e.g. a rank
+                    # mismatch against what the engine expects) — confirmed via a real run that
+                    # silently ignoring that return value lets execution continue with a
+                    # stale/wrong shape binding instead of failing loudly. See
+                    # docs/wan2.2_i2v_14b_notes.md.
+                    if not context.set_input_shape(name, tuple(tensor.shape)):
+                        raise RuntimeError(
+                            f"set_input_shape failed for input {name!r} with shape {tuple(tensor.shape)} "
+                            f"against engine {self.engine_path} — likely a rank or bounds mismatch "
+                            "against the profile this engine was built with."
+                        )
                     context.set_tensor_address(name, tensor.data_ptr())
                     inputs[name] = tensor  # keep the contiguous copy alive until execution completes
                 else:
@@ -118,6 +138,7 @@ def _trt_dtype_to_torch(dtype: "trt.DataType") -> torch.dtype:
         trt.DataType.BF16: torch.bfloat16,
         trt.DataType.INT8: torch.int8,
         trt.DataType.INT32: torch.int32,
+        trt.DataType.INT64: torch.int64,
         trt.DataType.BOOL: torch.bool,
         trt.DataType.FP8: torch.float8_e4m3fn,
     }

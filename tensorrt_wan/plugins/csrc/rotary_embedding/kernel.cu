@@ -4,32 +4,31 @@
 namespace tensorrt_wan {
 namespace plugins {
 
-// One thread per (b, h, s, d) with d in [0, headDim/2) — each thread produces both halves of the
-// rotated pair, matching the "rotate-half" split described in plugin.h.
+// One thread per (b, h, s, p) with pair index p in [0, headDim/2) — each thread rotates one
+// *adjacent* pair (x[2p], x[2p+1]), matching Wan's interleaved-pair convention described in
+// plugin.h (not the rotate-half split this kernel implemented previously).
 template <typename T>
 __global__ void rotaryEmbeddingKernel(const T* __restrict__ x, const T* __restrict__ cosTab,
                                        const T* __restrict__ sinTab, T* __restrict__ out, int heads, int seq,
                                        int headDim) {
   const int half = headDim / 2;
-  const int d = blockIdx.x * blockDim.x + threadIdx.x;
-  if (d >= half) return;
+  const int p = blockIdx.x * blockDim.x + threadIdx.x;
+  if (p >= half) return;
 
   const int s = blockIdx.y;
   const int bh = blockIdx.z;  // flattened (batch, head) index
-  const int h = bh % heads;
 
   const long base = (long)bh * seq * headDim + (long)s * headDim;
   const long cosSinBase = (long)s * headDim;
 
-  const float x1 = static_cast<float>(x[base + d]);
-  const float x2 = static_cast<float>(x[base + half + d]);
-  const float c1 = static_cast<float>(cosTab[cosSinBase + d]);
-  const float s1 = static_cast<float>(sinTab[cosSinBase + d]);
-  const float c2 = static_cast<float>(cosTab[cosSinBase + half + d]);
-  const float s2 = static_cast<float>(sinTab[cosSinBase + half + d]);
+  const float x1 = static_cast<float>(x[base + 2 * p]);
+  const float x2 = static_cast<float>(x[base + 2 * p + 1]);
+  // cos/sin tables are pre-duplicated per pair (cos[2p] == cos[2p+1]); either index works.
+  const float c = static_cast<float>(cosTab[cosSinBase + 2 * p]);
+  const float sn = static_cast<float>(sinTab[cosSinBase + 2 * p]);
 
-  out[base + d] = static_cast<T>(x1 * c1 - x2 * s1);
-  out[base + half + d] = static_cast<T>(x2 * c2 + x1 * s2);
+  out[base + 2 * p] = static_cast<T>(x1 * c - x2 * sn);
+  out[base + 2 * p + 1] = static_cast<T>(x1 * sn + x2 * c);
 }
 
 void launchRotaryEmbedding(const void* x, const void* cosTab, const void* sinTab, void* out, int batch, int heads,

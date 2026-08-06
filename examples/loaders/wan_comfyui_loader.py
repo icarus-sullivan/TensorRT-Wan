@@ -59,6 +59,73 @@ def _apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     return x_out.reshape(*x.shape).type_as(x)
 
 
+def _decomposed_sdpa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
+    is_causal: bool = False,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+) -> torch.Tensor:
+    """Reference (matmul + softmax + matmul) scaled dot-product attention — the same decomposition
+    PyTorch's own docs give as `scaled_dot_product_attention`'s defining math.
+
+    Confirmed necessary against real builds: `torch.onnx`'s dynamo exporter maps
+    `F.scaled_dot_product_attention` straight to ONNX opset 23's native `Attention` op, and
+    TensorRT 11.2's importer for that native op fails with `MyelinCheckException: ... Attention
+    operation was not supported by a dedicated kernel` for both the text encoder's masked
+    self-attention and the VAE's (unmasked) bottleneck self-attention — i.e. this isn't
+    mask-specific, the native-op import path itself doesn't have a fused kernel available for
+    either shape in this TensorRT version. The suggested fix in the error text
+    (`IAttention::setDecomposable`) isn't reachable from Python in this TensorRT version either
+    (confirmed separately: `network.get_layer()` returns the generic `ILayer` for
+    `ATTENTION_INPUT`/`ATTENTION_OUTPUT` layers, no downcast, no Python constructor). Decomposing
+    before export instead sidesteps the native op entirely — the resulting ONNX graph is plain
+    MatMul/Softmax nodes, which TensorRT's older, doc-confirmed MHA fusion pass can still
+    recognize and fuse (see docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/
+    transformers-fused-attention.html). See docs/wan2.2_i2v_14b_notes.md's 2026-08-06 session
+    section for the full investigation.
+    """
+    if enable_gqa:
+        n_rep = query.shape[-3] // key.shape[-3]
+        if n_rep > 1:
+            key = key.repeat_interleave(n_rep, dim=-3)
+            value = value.repeat_interleave(n_rep, dim=-3)
+    if scale is None:
+        scale = query.shape[-1] ** -0.5
+    attn_weight = query @ key.transpose(-2, -1) * scale
+    if is_causal:
+        seq_q, seq_k = query.shape[-2], key.shape[-2]
+        causal_mask = torch.ones(seq_q, seq_k, dtype=torch.bool, device=query.device).tril()
+        attn_weight = attn_weight.masked_fill(~causal_mask, float("-inf"))
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_weight = attn_weight.masked_fill(~attn_mask, float("-inf"))
+        else:
+            attn_weight = attn_weight + attn_mask
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    if dropout_p > 0.0:
+        attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ value
+
+
+def _decompose_attention_for_export() -> None:
+    """Monkeypatch `torch.nn.functional.scaled_dot_product_attention` to `_decomposed_sdpa` for
+    the duration of this process. Every attention call path in this loader (`comfy.ops`'s
+    `scaled_dot_product_attention` wrapper, used by both the text encoder and the VAE) bottoms
+    out in the real `torch.nn.functional.scaled_dot_product_attention` regardless of which
+    internal branch it takes, so patching that one global function covers both — see
+    `_decomposed_sdpa`'s docstring for why this is necessary. Only affects this process, not a
+    running ComfyUI server (separate process/memory space), same reasoning as the `apply_rope1`
+    monkeypatch in `load_dit`. Not applied in `load_dit` itself: the DiT's own attention already
+    finds a dedicated fused kernel with no such error, so it doesn't need this and re-decomposing
+    it would only cost performance for no correctness benefit.
+    """
+    torch.nn.functional.scaled_dot_product_attention = _decomposed_sdpa
+
+
 def _add_comfyui_to_path() -> None:
     """ComfyUI isn't a pip-installed package — its `comfy` module only imports if ComfyUI's own
     repo root is on sys.path. Set COMFYUI_ROOT, or this defaults to the path this loader was
@@ -123,3 +190,135 @@ def load_dit(checkpoint_path: str) -> torch.nn.Module:
 
     diffusion_model.eval()
     return diffusion_model
+
+
+class _TextEncoderWrapper(torch.nn.Module):
+    """`comfy.text_encoders.t5.T5.forward` returns `(x, intermediate)` — `intermediate` is only
+    populated when a caller asks for a specific `intermediate_output` layer (SD1ClipModel's
+    hidden-state-extraction feature), which the TensorRT `TextEncoderExporter`/`TextEncoderEngine`
+    contract has no use for (single `text_embeds` output only). This wrapper is exactly what
+    `example_inputs()`'s `input_ids`/`attention_mask` names get called against; without it,
+    `torch.export` would trace `exporter.model.__call__` against a 2-tuple return, mismatching
+    `TextEncoderExporter.output_names`'s single `text_embeds`.
+    """
+
+    def __init__(self, transformer: torch.nn.Module) -> None:
+        super().__init__()
+        self.transformer = transformer
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        return self.transformer(input_ids, attention_mask)[0]
+
+
+def load_text_encoder(checkpoint_path: str) -> torch.nn.Module:
+    """Load Wan's UMT5-XXL text encoder via `comfy.sd.load_clip` and return the raw transformer
+    (not ComfyUI's `CLIP` wrapper, which handles tokenization/chunking/weighting — none of which
+    the exported engine needs; `TextEncoderEngine.encode_text` does its own tokenization on CPU
+    and calls the engine directly with `input_ids`/`attention_mask`).
+
+    Real attribute path confirmed on RunPod hardware (not documented anywhere in ComfyUI's own
+    code comments): `comfy.sd.load_clip(..., clip_type=CLIPType.WAN)` returns a `CLIP` whose
+    `.cond_stage_model` is a `WanTEModel` (`comfy.text_encoders.wan.te`'s closure class) with a
+    `.umt5xxl` attribute (an `SDClipModel`, named after the `name="umt5xxl"` kwarg
+    `WanT5Model.__init__` passes up) — `.umt5xxl.transformer` is the actual `comfy.text_encoders
+    .t5.T5` module, whose `forward(input_ids, attention_mask, ...)` matches
+    `TextEncoderExporter`'s input names directly (see `_TextEncoderWrapper` above for the one
+    mismatch: its 2-tuple return).
+    """
+    _add_comfyui_to_path()
+    _decompose_attention_for_export()
+
+    import comfy.sd  # noqa: E402
+    import folder_paths  # noqa: E402
+
+    device = os.environ.get("TRTWAN_LOADER_DEVICE", "cuda")
+    dtype = _DTYPES[os.environ.get("TRTWAN_LOADER_DTYPE", "fp16")]
+
+    clip = comfy.sd.load_clip(
+        ckpt_paths=[checkpoint_path],
+        embedding_directory=folder_paths.get_folder_paths("embeddings"),
+        clip_type=comfy.sd.CLIPType.WAN,
+        model_options={},
+    )
+    transformer = clip.cond_stage_model.umt5xxl.transformer
+    transformer = transformer.to(device=device, dtype=dtype)
+    transformer.eval()
+    return _TextEncoderWrapper(transformer)
+
+
+class _VAEEncodeWrapper(torch.nn.Module):
+    """`comfy.ldm.wan.vae2_2.WanVAE` has `.encode(x)`/`.decode(z)` methods, not a single unified
+    `forward` — `torch.export.export(module, ...)` traces `module.__call__`/`forward`, so each
+    direction needs its own thin wrapper exposing the method it needs as `forward`. This one
+    exists for `VAEEncoderExporter` (`pixels` -> `latent`); see `_VAEDecodeWrapper` below for the
+    other direction.
+    """
+
+    def __init__(self, vae: torch.nn.Module) -> None:
+        super().__init__()
+        self.vae = vae
+
+    def forward(self, pixels: torch.Tensor) -> torch.Tensor:
+        return self.vae.encode(pixels)
+
+
+class _VAEDecodeWrapper(torch.nn.Module):
+    """See `_VAEEncodeWrapper` above. This direction is for `VAEDecoderExporter` (`latent` ->
+    `pixels`)."""
+
+    def __init__(self, vae: torch.nn.Module) -> None:
+        super().__init__()
+        self.vae = vae
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.vae.decode(latent)
+
+
+def _load_wan_vae(checkpoint_path: str) -> torch.nn.Module:
+    """Shared by `load_vae_encoder`/`load_vae_decoder` — both directions live in the same
+    checkpoint/module (`comfy.ldm.wan.vae2_2.WanVAE`, confirmed via `comfy.sd.VAE`'s dispatch on
+    the real `wan2.2_vae.safetensors` file on RunPod hardware), so there's one real load here and
+    two thin per-direction wrappers around it, not two separate loads.
+
+    Caller (`export`/`build` CLI) treats `checkpoint_path` as opaque — for this VAE it must be
+    ComfyUI's own `models/vae/wan2.2_vae.safetensors`, not a diffusion_models/text_encoders path.
+    """
+    _add_comfyui_to_path()
+    _decompose_attention_for_export()
+
+    import comfy.ops  # noqa: E402
+    import comfy.sd  # noqa: E402
+    import comfy.utils  # noqa: E402
+
+    # comfy.ops.Conv3d._conv_forward calls torch.cudnn_convolution directly (bypassing
+    # nn.Conv3d's normal _conv_forward/F.conv3d) whenever NVIDIA_MEMORY_CONV_BUG_WORKAROUND is
+    # True — a deliberate, real workaround for an actual cuDNN memory bug (gated on cuDNN
+    # 9.10.2-9.15.0 + torch 2.9-2.10, which matches this environment exactly, see comfy/ops.py).
+    # `torch.cudnn_convolution` has no FakeTensor/meta kernel registered, so torch.export fails
+    # with `UnsupportedOperatorException: aten.cudnn_convolution.default` — confirmed against a
+    # real export attempt on RunPod hardware. Safe to disable for the duration of export only:
+    # non-strict `torch.export` traces against FakeTensors, never runs a real cuDNN kernel, so
+    # the memory bug this workaround exists for is simply not in play here. Only affects this
+    # process, not a running ComfyUI server (separate process/memory space) — same reasoning as
+    # the `apply_rope1` monkeypatch above.
+    comfy.ops.NVIDIA_MEMORY_CONV_BUG_WORKAROUND = False
+
+    device = os.environ.get("TRTWAN_LOADER_DEVICE", "cuda")
+    dtype = _DTYPES[os.environ.get("TRTWAN_LOADER_DTYPE", "fp16")]
+
+    sd, metadata = comfy.utils.load_torch_file(checkpoint_path, return_metadata=True)
+    vae = comfy.sd.VAE(sd=sd, metadata=metadata)
+    vae.throw_exception_if_invalid()
+    first_stage_model = vae.first_stage_model.to(device=device, dtype=dtype)
+    first_stage_model.eval()
+    return first_stage_model
+
+
+def load_vae_encoder(checkpoint_path: str) -> torch.nn.Module:
+    """See `_load_wan_vae`/`_VAEEncodeWrapper`."""
+    return _VAEEncodeWrapper(_load_wan_vae(checkpoint_path))
+
+
+def load_vae_decoder(checkpoint_path: str) -> torch.nn.Module:
+    """See `_load_wan_vae`/`_VAEDecodeWrapper`."""
+    return _VAEDecodeWrapper(_load_wan_vae(checkpoint_path))

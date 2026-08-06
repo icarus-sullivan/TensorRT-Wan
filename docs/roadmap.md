@@ -65,9 +65,95 @@ On RTX PRO 6000 Blackwell instances:
       `/root/.cache` with no CLI override (added a global `--cache-dir` flag). See
       wan2.2_i2v_14b_notes.md for all of these in detail — this is now the most-verified path in
       the whole repo.
-- [ ] What's still not done: real I2V conditioning content (the 36-channel `x` was still zeros,
-      not real noise+image+mask), the reshape-constant-baking correctness gap noted above, and
-      ONNX export + engine build for text_encoder/vae_encoder/vae_decoder (only DiT verified)
+- [x] `DiTEngine._build_inputs` (`engine/dit_engine.py`) now channel-concatenates
+      `first_frame`/`last_frame` conditioning (+ a mask) onto `x` in the confirmed
+      noise(16)++image_latent(16)++mask(4) order, instead of raising `NotImplementedError` for
+      any non-text conditioning kind. Source-only fix (`_concat_image_conditioning`), no GPU here
+      to run it. Zero-pads the reference frame's latent to `x`'s full temporal length and uses a
+      binary (1.0 at the conditioned frame / 0.0 elsewhere) mask broadcast across all 4 mask
+      channels — both are documented best-effort defaults, **not** confirmed to match ComfyUI's
+      real `WanImageToVideo` node (which gray-pads pixel-space and VAE-encodes the whole padded
+      video, likely producing non-zero latents for the padding frames). Needs a RunPod numeric
+      comparison before trusting I2V output quality.
+- [x] `VAEEncoderExporter` (`export/exporters/vae.py`) unified around a 5D `(B, 3, T, H, W)`
+      `pixels` input with a dynamic frame axis (T=1 opt case), instead of a fixed rank-4
+      `(B, 3, H, W)` input — fixes a real internal inconsistency: `VAEEncoderEngine.encode_video`
+      (`engine/vae_engine.py`) was already calling the same built engine with a rank-5 tensor,
+      which a rank-4-exported engine cannot accept. `encode_image` now unsqueezes to rank-5
+      (T=1) before inference to match. Source-only fix, no GPU here to run it — rests on an
+      unconfirmed assumption that Wan's real VAE module is video-native (causal 3D conv, image =
+      T=1) rather than genuinely having two different forward paths; needs checking against
+      ComfyUI's actual VAE source (not available in this environment) before trusting it.
+- [x] RoPE fix re-verified end to end: full DiT `torch.export`→ONNX→TensorRT pipeline re-run on
+      real Blackwell hardware with the fixed `RotaryEmbedding` kernel, still succeeds (26.6GiB
+      engine). Found and fixed two more environment/version-skew bugs along the way (newer torch
+      needs `dynamic_shapes` dict entries for every arg, not just dynamic ones; newer
+      `torch.onnx` needs `onnxscript` installed separately) — see wan2.2_i2v_14b_notes.md's
+      2026-08-06 session section.
+- [x] `load_text_encoder`/`load_vae_encoder`/`load_vae_decoder` written (`wan_comfyui_loader.py`)
+      — didn't exist before, only `load_dit` did.
+- [x] **All four component engines now built** (DiT, text_encoder, vae_encoder, vae_decoder), all
+      in `/workspace/runpod-slim/trtwan_engines/`. Text encoder and VAE both needed the same real
+      fix: TensorRT 11.2's native-ONNX-`Attention`-op import path can't find a fused kernel for
+      either (masked T5 self-attention *or* the VAE's unmasked bottleneck self-attention — not
+      mask-specific), and `IAttention.decomposable` (the fix the error message itself suggests)
+      isn't reachable from Python in this TensorRT version at all (confirmed: no downcast from
+      the generic `ILayer`, no constructor). Real fix: monkeypatch
+      `scaled_dot_product_attention` to a decomposed matmul+softmax+matmul form before export so
+      the native op is never emitted — worked for both. VAE additionally needed a
+      `cudnn_convolution`-has-no-FakeTensor-kernel fix (monkeypatch
+      `comfy.ops.NVIDIA_MEMORY_CONV_BUG_WORKAROUND = False` for the export trace only, safe since
+      no real cuDNN kernel runs during FakeTensor tracing) and a checkpoint correction —
+      `wan2.2_vae.safetensors` is the *wrong* file for these 14B checkpoints (z_dim=48, for Wan
+      2.2's separate 5B TI2V model); `wan_2.1_vae.safetensors` is correct (z_dim=16, matches the
+      DiT). Also found and fixed a real `EngineCache` bug along the way: `CacheKey` had no
+      `component` field, so `vae_encoder`/`vae_decoder` (same checkpoint, same profile/precision)
+      collided on the same cache digest — a decoder build attempt was silently served the
+      encoder's engine. See wan2.2_i2v_14b_notes.md's 2026-08-06 session section for full detail
+      on all of the above.
+- [x] First real end-to-end run, all four engines together, real prompt + two real reference
+      images. Found and fixed two serious infra bugs in `engine/base.py`'s
+      `TensorRTEngineWrapper._infer_trt`, both silent-corruption classes rather than one-off:
+      (1) `context.set_input_shape()`'s bool return value was never checked — now raises loudly;
+      (2) `set_tensor_address()` was handed raw pointers with no dtype conversion, so a float32
+      `timestep` (scheduler's default) got byte-reinterpreted as float16 by the engine (built with
+      a float16 `timestep` input), producing NaN on the very first denoising step — now every
+      input is cast to the engine's own declared dtype before use. Also fixed a real
+      `DiTEngine._build_inputs` bug caught before it ever ran on GPU: image conditioning was
+      concatenated once per kind, so `first_frame`+`last_frame` together would have produced 56
+      channels against the engine's fixed 36 — now built as one combined 16ch+4ch pair. VAE
+      encode→decode round-trip independently verified correct (real recognizable chair image).
+- [x] **Root cause of the content-quality bug narrowed conclusively.** Swept `shift` in
+      `[1,2,3,5,8]` — ruled out, all values converge to nearly-identical (wrong) output. Then ran
+      the decisive check: the built DiT TensorRT engine vs. the real eager 14.29B-param checkpoint
+      on byte-identical inputs (`x`/`timestep`/`context`) — **cosine_similarity=0.999995,
+      max_abs_diff=0.0137**, essentially a perfect match within fp16 noise. **This clears the
+      entire export/build pipeline** (RoPE fix, decomposed attention, everything) — the engine
+      faithfully reproduces the real model. Since eager and TensorRT agree almost exactly and
+      still produce bad output together, the bug isn't engine conversion — it's what gets fed to
+      the model. Every other candidate (image-conditioning magnitude, CFG scale, scheduler shift)
+      is now ruled out too, leaving one clear remaining suspect: `_concat_image_conditioning`'s
+      unconfirmed zero-padding/binary-mask policy vs. what ComfyUI's real `WanImageToVideo` node
+      actually builds. See wan2.2_i2v_14b_notes.md's "Shift sweep and the decisive
+      eager-vs-TensorRT comparison" section.
+- [x] **Found and fixed the real bug — first genuinely coherent I2V output.** Read
+      `comfy_extras/nodes_wan.py`'s real `WanImageToVideo` node and `WAN21.concat_cond`
+      (`comfy/model_base.py`, the code that actually assembles the DiT's `x`): real channel order
+      is `noise(16) ++ mask(4) ++ image_latent(16)` — mask *before* image latent.
+      `_concat_image_conditioning` had them reversed since it was first written. Fixed
+      (`engine/dit_engine.py`). Re-ran the real prompt/images end to end: `final_latents` went
+      from mean=1.76/std=4.79 (runaway drift) to mean=0.05/std=1.10 (stable, well-behaved) —
+      decoded frames now show real spatial structure (chair-shaped dark band against a wall with
+      matching window/pipe detail), consistent across all 9 frames. Still low quality (20 steps,
+      256×256 test res) and mask polarity/gray-fill-padding details remain only partially
+      confirmed (see below), but structurally working for the first time. See
+      wan2.2_i2v_14b_notes.md's "Found and fixed: real channel-order bug" section.
+- [ ] Still open: the gray-fill-padding discrepancy (`WanImageToVideo` gray-fills pixel-space
+      before VAE-encoding the whole padded video in one call — this repo zero-pads directly in
+      latent space instead, likely smaller-magnitude than the channel-order bug was but
+      unmeasured), independent confirmation of the first_frame=index-0/last_frame=index-(-1)
+      temporal convention, a higher-step/full-resolution quality run, and the VAE 5D-unification
+      assumption in `export/exporters/vae.py` — all still unverified against real ComfyUI source
 - [ ] Build engines for the default resolution profiles and confirm cache hit/miss behavior —
       also revisit `_build_optimization_profile`: found while doing this that
       `ResolutionProfile.height`/`.width` are never actually read there, so multiple resolution
@@ -77,11 +163,13 @@ On RTX PRO 6000 Blackwell instances:
 - [ ] Same for I2V
 - [ ] Wire a real FlashAttention-2/3 or SageAttention backend into `CustomAttentionPlugin`
       (currently unimplemented, see `custom_attention/kernel_dispatch.cpp`)
-- [ ] `RotaryEmbedding` plugin (`plugins/csrc/rotary_embedding/kernel.cu`) is confirmed wrong —
-      implements rotate-half, but Wan actually uses interleaved-pair rotation (confirmed against
-      ComfyUI's real `comfy/ldm/flux/math.py` source). Rewrite against
-      `examples/loaders/wan_comfyui_loader.py`'s cloned `_apply_rope1` reference; see
-      wan2.2_i2v_14b_notes.md and plugins.md's validation status section
+- [x] `RotaryEmbedding` plugin (`plugins/csrc/rotary_embedding/kernel.cu`) rewritten from
+      rotate-half to Wan's actual interleaved-pair rotation, matching
+      `examples/loaders/wan_comfyui_loader.py`'s cloned `_apply_rope1` reference (adjacent pairs
+      x[2i]/x[2i+1] rotated by a shared angle; cos/sin tables now expected repeat-interleaved,
+      not concat-duplicated). Source-only fix, no GPU here to build/run it — still needs the
+      isolated numeric comparison against the PyTorch reference on RunPod before it's trusted in
+      a built engine; see plugins.md's validation status section
 - [ ] Per-op FP8 quality gating on Blackwell (PLAN.md: never reduce precision without confirming
       negligible quality loss)
 - [ ] Real FP8 quantization is not implemented. `export/trt_build.py`'s `_validate_precision`

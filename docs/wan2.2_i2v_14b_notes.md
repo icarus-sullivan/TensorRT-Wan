@@ -200,13 +200,21 @@ DiT's input channel count with the VAE's unrelated 16-channel latent space). `Di
 `_build_inputs` raises `NotImplementedError` for any non-text conditioning rather than silently
 mis-routing it into a tensor name the engine doesn't have.
 
-**Still open:** the *exact* channel order/construction of that 36-channel `x` (which 16 channels
-are noise vs. image-latent, how the 4-channel mask is built) lives in whatever ComfyUI node
-normally constructs it for this model (likely a stock `WanImageToVideo`-equivalent, not yet
-located) — needed before a real I2V export, not needed for a T2V-only attempt (T2V could
-plausibly zero-fill the extra 20 channels, unconfirmed). `example_inputs()` still just traces
-against zeros for `x` — fine for proving export/ONNX/engine-build mechanics work, not sufficient
-for a numerically correct I2V engine.
+**Update — `DiTEngine._build_inputs` now does the concatenation** (`engine/dit_engine.py`'s
+`_concat_image_conditioning`, source-only change, no GPU here to run it): `first_frame`/
+`last_frame` embeddings get channel-concatenated onto `x` in the confirmed
+noise(16)++image_latent(16)++mask(4) order, zero-padded to the full temporal length with a binary
+mask at the conditioned frame. `example_inputs()` still traces against zeros for `x` — that's
+fine, tracing only needs correct shape/dtype, not real values (confirmed earlier: no
+data-dependent control flow in the traced graph).
+
+**Still open:** the *exact* padding/mask construction lives in whatever ComfyUI node normally
+builds it for this model (likely a stock `WanImageToVideo`-equivalent, not yet located) —
+`_concat_image_conditioning`'s zero-padding + binary-mask policy is a documented best-effort
+default, not confirmed to match it (that node gray-pads pixel-space and VAE-encodes the whole
+padded video, which likely produces non-zero latents for the padding frames — zero-padding here
+may be numerically wrong even though shapes match). Needs locating that node's source and a
+RunPod numeric comparison before trusting I2V output quality, not needed for a T2V-only attempt.
 
 ## `torch.export` succeeded — full model, real checkpoint
 
@@ -604,3 +612,350 @@ constructing `RuntimeManager()` used hardcoded defaults.
 constructing `RuntimeManager()` directly — one flag, threaded everywhere, rather than duplicating
 override logic per command. The engine already built was manually moved to
 `/workspace/runpod-slim/trtwan_engines/` in the meantime.
+
+## 2026-08-06 session: re-verified DiT after the RoPE fix, then did text_encoder/VAE for the first time
+
+Fresh RunPod instance (RTX PRO 6000 Blackwell, `torch.cuda.get_device_capability() == (12, 0)`,
+i.e. SM120), `torch` 2.10.0+cu128 — notably newer than whatever version the sections above were
+written against, and it surfaced two environment/version-skew bugs neither of which are logic
+bugs in this repo's own code:
+
+**`torch.export`'s `dynamic_shapes` dict validation got stricter.** `torch._dynamo.exc.UserError:
+When dynamic_shapes is specified as a dict, its top-level keys must be the arg names [...] of
+inputs, but here they are ['x']` — `export/torch_export.py`'s `_build_dynamic_shapes` only added
+dict entries for inputs that actually had dynamic axes (`x` for `DiTExporter`), omitting
+`timestep`/`context` entirely, which worked on whatever older torch version this was last run
+against. Fixed: every `example_inputs()` key now gets an entry, `None` for inputs with no dynamic
+axes, instead of being omitted.
+
+**`torch.onnx`'s newer dynamo-based exporter needs `onnxscript`,** not bundled with `torch`
+itself — `ModuleNotFoundError: No module named 'onnxscript'` on the first real `torch.onnx.export`
+call. Fixed by `pip install onnxscript` on the pod; not a repo code change, just an environment
+setup step worth recording since it wasn't needed on whatever torch version this repo's earlier
+sessions used.
+
+With both fixed, **re-ran the full DiT pipeline end to end and it still holds** with the RoPE
+kernel fix from today (`plugins/csrc/rotary_embedding/`, see plugins.md) — `torch.export` → ONNX
+(~44min, mostly the dynamo translation phase) → TensorRT engine (~35min, 26.6GiB, cache correctly
+landing on `/workspace/runpod-slim/trtwan_engines/` via `--cache-dir`, not `/root/.cache`). Same
+`kMAX`/`kMIN` "not self-consistent" reshape warning as before — already-tracked, didn't block the
+build.
+
+### Text encoder and VAE: first real attempt, new loaders written from scratch
+
+No `load_text_encoder`/`load_vae_encoder`/`load_vae_decoder` existed before this session — only
+`load_dit`. Added all three to `examples/loaders/wan_comfyui_loader.py`, deriving the real
+attribute paths by loading each via ComfyUI's own code and introspecting on RunPod hardware
+(same method `load_dit` was originally derived by):
+
+- **Text encoder:** `comfy.sd.load_clip(..., clip_type=CLIPType.WAN)` → `.cond_stage_model` is a
+  `WanTEModel`, whose `.umt5xxl` attribute (named after `WanT5Model`'s `name="umt5xxl"` kwarg) is
+  an `SDClipModel` wrapping the real transformer at `.transformer` — a `comfy.text_encoders.t5.T5`
+  instance whose `forward(input_ids, attention_mask, ...)` matches `TextEncoderExporter`'s input
+  names directly. Its return is a `(x, intermediate)` tuple, not a single tensor — needed a thin
+  `_TextEncoderWrapper` around it (`forward` returns `[0]` only) since `TextEncoderExporter`
+  expects one `text_embeds` output.
+- **VAE encoder/decoder:** `comfy.sd.VAE(sd=..., metadata=...).first_stage_model` is a
+  `comfy.ldm.wan.vae2_2.WanVAE` (confirmed the real dispatch target for `wan2.2_vae.safetensors`
+  specifically, not the Wan 2.1 `comfy.ldm.wan.vae.WanVAE` class) — has separate `.encode(x)`/
+  `.decode(z)` methods, not a unified `forward`, so needed two thin wrappers
+  (`_VAEEncodeWrapper`/`_VAEDecodeWrapper`) each exposing one direction as `forward`.
+  **Not yet investigated:** both `WanVAE.encode`/`.decode` have a Python-level `for i in
+  range(iter_)` loop where `iter_` is computed from the input's actual temporal size (chunked
+  causal-conv processing, 4 frames per chunk) — this is data-dependent control flow, the same
+  category of thing that broke `Dim(min=,max=)` on the DiT months ago. Neither export was
+  actually attempted this session (see below) so whether `Dim.AUTO` handles this by specializing
+  cleanly (like DiT's batch dim did) or hard-fails is still unknown — flagging rather than
+  chasing further tonight, this needs its own dedicated pass before VAE export is attempted.
+
+**Text encoder ONNX export succeeded first try** (~5s, batch specialized to 1 same as DiT, no
+other issues) — `text_encoder.onnx` (2.7MB graph + 11.3GB external weights).
+
+**Text encoder engine build found two more real bugs, then hit a real dead end:**
+
+1. `export/trt_build.py`'s `_validate_precision` rejected `input_ids`/`attention_mask` for being
+   `INT64` instead of the requested `fp16` — a real bug, not a text-encoder-specific one: the
+   check was written against the DiT, where every input genuinely is a float activation, and
+   never accounted for legitimately-integer inputs (token ids, an int/bool mask) that were never
+   supposed to match a float precision in the first place. **Fixed:** only floating-point-typed
+   inputs are checked now; int/bool inputs are skipped entirely.
+2. Same batch-as-dynamic-profile-axis bug the DiT hit before (`docs` section above, "Fourth
+   finding") — `TextEncoderExporter.dynamic_axes()` still declared a `dim0` (batch) profile range
+   despite the graph specializing batch to a fixed value (confirmed by the export-time "0/1
+   specialized" warning). **Fixed:** removed `dim0` from `TextEncoderExporter.dynamic_axes()`,
+   same fix pattern as `DiTExporter`'s.
+3. **Real dead end, not fixed:** past both of those, the build failed with `MyelinCheckException:
+   ... Attention operation was not supported by a dedicated kernel`, for T5's masked
+   self-attention specifically (an additive float mask built from `attention_mask`, not a
+   causal/simple-padding pattern). The error names its own suggested fix —
+   `IAttention::setDecomposable` — which exists in the C++ API (`trt.IAttention.decomposable` is
+   a real property, confirmed via `dir()`), but **is not reachable from Python in this TensorRT
+   version (11.2.1.2)**: `network.get_layer(i)` returns the generic base `ILayer` for
+   `ATTENTION_INPUT`/`ATTENTION_OUTPUT` layer types rather than auto-downcasting to
+   `IAttentionInputLayer`/`IAttentionOutputLayer` the way older/more established layer types do,
+   and there's no Python-callable cast — confirmed directly by testing both `layer.attention`
+   (`AttributeError`) and `trt.IAttentionInputLayer(layer)` (`TypeError: No constructor
+   defined!`) against the real parsed network (48 attention-boundary layers found, same failure
+   on all of them). Checked NVIDIA's fused-attention-kernel docs
+   (`transformers-fused-attention.html`): for our GPU's bucket (SM75-SM90/SM120/SM121), FP16 head
+   dim 16–256 and "any masking" are both claimed supported, and the DiT's own (unmasked)
+   attention did find a dedicated kernel with no such error — so this looks like a real gap
+   between that doc and TensorRT 11.2's actual native-ONNX-`Attention`-op import path
+   specifically for a masked case, not a config mistake on this repo's side.
+
+**Update — the real fix was attempted and worked, for both text encoder and VAE.** Added
+`_decomposed_sdpa`/`_decompose_attention_for_export` to `wan_comfyui_loader.py`: monkeypatches
+`torch.nn.functional.scaled_dot_product_attention` (the function every comfy attention path
+bottoms out in, confirmed by reading `comfy/ops.py`) to a manual matmul+softmax+matmul
+decomposition — same technique as `_apply_rope1`'s RoPE monkeypatch, applied only in
+`load_text_encoder`/`_load_wan_vae`, not `load_dit` (whose attention already finds a fused kernel
+and doesn't need it). This turned out **not to be mask-specific**: the VAE's bottleneck
+self-attention (unmasked) hit the exact same `MyelinCheckException` the masked text-encoder
+attention did, so the native opset-23 `Attention` op import path itself is the problem in this
+TensorRT version, not anything about the mask. After re-exporting with the decomposed form, both
+components built cleanly. Text encoder engine build took ~28min (vs. VAE's ~1min) — decomposing
+costs real build/runtime time relative to a fused kernel, but it's now *correct*, not broken.
+
+**Second real export bug, found building the VAE (not the text encoder):**
+`torch._subclasses.fake_tensor.UnsupportedOperatorException: aten.cudnn_convolution.default`.
+Root cause: `comfy.ops.Conv3d._conv_forward` calls `torch.cudnn_convolution` directly (bypassing
+`nn.Conv3d`'s normal path) whenever `comfy.ops.NVIDIA_MEMORY_CONV_BUG_WORKAROUND` is `True` — a
+real, deliberate workaround for an actual cuDNN memory bug, gated on cuDNN 9.10.2–9.15.0 + torch
+2.9–2.10 (`comfy/ops.py`), which matches this environment's versions exactly. `cudnn_convolution`
+has no FakeTensor/meta kernel, so `torch.export` can't trace through it. **Fixed** by monkeypatching
+`comfy.ops.NVIDIA_MEMORY_CONV_BUG_WORKAROUND = False` in `_load_wan_vae`, safe because
+non-strict `torch.export` never runs a real cuDNN kernel during tracing (FakeTensors only) — the
+actual memory bug this workaround exists for is simply not in play at export time, and this never
+touches a running ComfyUI server (separate process).
+
+**VAE encoder export succeeded** once both of the above were fixed — and confirmed the
+data-dependent-shape question flagged above: the export-time warning showed `pixels.shape[2]`
+(the frame axis) specializing to a fixed value, same "0/1 specialized" pattern as DiT's batch dim,
+*not* a hard failure. `Dim.AUTO` handled `WanVAE.encode`'s chunked-loop trip count by baking in
+the traced `frames` value rather than erroring — confirms this export is only valid for the
+traced frame count (T=1 for single-image/I2V-reference-frame use), not genuinely T-dynamic.
+Fixed `VAEEncoderExporter.dynamic_axes()` to drop both `dim0` (batch) and `dim2` (frames),
+keeping only height/width dynamic, mirroring the same fix pattern already applied twice.
+
+**Third real finding, and an important correction: wrong VAE checkpoint file.** VAE decoder
+export hit `RuntimeError: Given groups=1, weight of size [48, 48, 1, 1, 1] ... but got 16
+channels` — traced by directly introspecting the loaded model (`vae.first_stage_model.z_dim`)
+rather than guessing from source: `wan2.2_vae.safetensors` dispatches to
+`comfy.ldm.wan.vae2_2.WanVAE` with **`z_dim=48`**, not 16. Checked `wan_2.1_vae.safetensors`
+the same way: dispatches to the older `comfy.ldm.wan.vae.WanVAE` class, **`z_dim=16`** — matching
+the DiT's expected 16-channel noise/image-latent portions exactly. Conclusion: Wan 2.2 ships a
+*separate*, newer 48-channel VAE (`wan2.2_vae.safetensors`) for its 5B TI2V model specifically;
+the 14B I2V MoE checkpoints this repo targets (`wan2.2_i2v_{high,low}_noise_14B_fp16`) still pair
+with the original Wan 2.1 16-channel VAE. **`wan2.2_vae.safetensors` was the wrong file for this
+repo's loader to use against these checkpoints** — `load_vae_encoder`/`load_vae_decoder`'s
+docstrings/usage should point at `wan_2.1_vae.safetensors`, not the file its name would suggest.
+The VAE encoder build from the previous section was against the *wrong* checkpoint (48ch,
+incompatible with the DiT) and was rebuilt against the correct one after this was found.
+
+**Fourth real finding, unrelated to the VAE itself but found while rebuilding:** `EngineCache`'s
+`CacheKey` (`runtime/cache.py`) had no `component` field — `vae_encoder` and `vae_decoder` share
+one checkpoint file (identical `model_hash`) and were built with the same profile/precision too,
+so they collided on the exact same cache digest. Confirmed as a live bug, not theoretical: the
+first (mis-targeted, wrong-checkpoint) `vae_decoder` build attempt returned "Using cached engine"
+and silently served back the *encoder's* engine file. **Fixed:** added `component: str` to
+`CacheKey`, populated from `exporter.name` at both construction sites (`cli/commands/build.py`,
+`export/pipeline.py`); old cache entries (missing the field) safely stop matching rather than
+crashing, per `EngineCache.get()`'s existing "metadata mismatch; treating as a miss" handling —
+no manual cache cleanup needed. Added a regression test
+(`test_different_component_is_a_different_cache_entry`) to `tests/test_cache.py`.
+
+**Both VAE encoder and VAE decoder engines then built successfully** against the correct
+`wan_2.1_vae.safetensors` checkpoint. `VAEDecoderExporter.dynamic_axes()` got the same
+batch+frame-axis fix as the encoder, by analogy (not independently re-confirmed via its own
+specialization warning, but the export succeeded with it applied).
+
+**All four components (DiT, text_encoder, vae_encoder, vae_decoder) have built TensorRT
+engines**, all in `/workspace/runpod-slim/trtwan_engines/`.
+
+## First real end-to-end I2V run: two serious infra bugs found and fixed, generation quality still open
+
+Wrote a standalone integration script (`/workspace/runpod-slim/i2v_smoke_test.py`, scratch, not
+committed) driving all four engines directly — real prompt ("the camera moves to the left as it
+zooms out to show the full green chair"), two real reference images
+(`close_green_chair_{start,end}.png`), real ComfyUI tokenizer (not `transformers.AutoTokenizer`,
+which would use the wrong vocab entirely), `FlowMatchEulerScheduler`. Resolution pinned to
+256x256 (32x32 latent) — exactly the DiT engine's opt shape, sidestepping the known
+reshape-constant-baking bug rather than risking a wrong-but-not-crashing result at a non-opt
+shape. Latent frame count 3, matching both DiT's opt and the VAE decoder's fixed frame axis.
+
+**Zeroth bug, caught before ever running:** the first version of `DiTEngine._build_inputs`
+concatenated image conditioning once *per kind* — correct for `first_frame` alone, but
+`first_frame` + `last_frame` together would have produced 56 channels against the engine's fixed
+36. **Fixed** before any GPU time was spent on it: `_concat_image_conditioning` now builds one
+combined 16-channel image_latent + one combined 4-channel mask across every present kind, each
+placed at its own temporal position, matching the confirmed single-slot architecture.
+
+**GPU memory contention, not a bug:** first run OOM'd loading the DiT engine.
+`nvidia-smi --query-compute-apps` showed a concurrent ComfyUI server (the user's own session)
+holding ~66GB of the 97.9GB GPU. Rewrote the script to load/use/unload engines one at a time
+(peak ~28.6GB) as a `SEQUENTIAL` toggle — worth keeping for low-VRAM setups generally, not just
+this incident. Once the user confirmed the ComfyUI server was done and it was terminated
+(SIGTERM, GPU fully freed to 0MiB used), switched to loading all four upfront instead.
+
+**First real crash-free run produced a wall of TensorRT `setInputShape` errors, silently
+ignored.** `TensorRTEngineWrapper._infer_trt` never checked `context.set_input_shape()`'s return
+value — it returns a bool rather than raising. Root cause: `SchedulerState.current_timestep`
+(`scheduler/state.py`) returns a 0-d scalar (`self.timesteps[self.step_index]`, indexing a 1-d
+tensor with a plain int), but `DiTExporter.example_inputs()` declared `timestep` as rank-1
+(shape `(1,)`) at export time — a real rank mismatch on every single DiT call, `nbDims` 0 vs 1.
+**Fixed two things:** (1) `DiTEngine._build_inputs` now does `timestep.reshape(1)` (a no-op if
+already rank-1); (2) `TensorRTEngineWrapper._infer_trt` now checks `set_input_shape`'s return
+value and raises loudly instead of silently continuing with a stale binding — this class of bug
+(TensorRT API returning failure via bool instead of exception) could bite any future input, not
+just this one.
+
+**Re-ran clean of the shape error, but `final_latents` came out all-NaN — again traced to the
+same `timestep` tensor, a different aspect of it.** `cond_out` was already NaN on the *first*
+denoising step (timestep=1000.0), before any accumulation. Root cause:
+`TensorRTEngineWrapper._infer_trt` calls `context.set_tensor_address(name, tensor.data_ptr())`
+with **no dtype conversion** — `FlowMatchEulerScheduler`'s `timestep` is float32
+(`torch.linspace`'s default dtype), but the DiT engine's `timestep` binding was exported as
+float16. TensorRT reinterpreted the same raw bytes as fp16 instead of converting them, producing
+garbage. **Fixed generically, not just for `timestep`:** `_infer_trt` now casts every input
+tensor to `_trt_dtype_to_torch(engine.get_tensor_dtype(name))` before use — protects every input
+on every engine from this exact silent-corruption class of bug, not a narrow timestep-only patch.
+(Along the way, `_trt_dtype_to_torch`'s mapping was also missing `INT64` entirely — added it;
+needed for `text_encoder`'s legitimately-int64 `input_ids`/`attention_mask`, which broke when the
+dtype-cast fix first landed and immediately surfaced the gap.)
+
+**With both fixes, the pipeline runs numerically clean end to end — no NaN, no crashes, sane
+value ranges at every stage** (confirmed via a `stats()` helper printing min/max/mean/std/nan/inf
+at each stage: `first_frame_latent`/`last_frame_latent` after VAE encode, a **VAE round-trip
+diagnostic** — decoding `first_frame_latent` alone (repeated to fill 3 frames) completely
+bypassing DiT — which produced a genuinely recognizable image of the green chair, confirming VAE
+encode/decode and the earlier `wan_2.1_vae.safetensors` checkpoint correction are both actually
+correct, not just shape-plausible), `initial_latents`, per-step `latents` during denoising, and
+final decoded pixels.
+
+**But the actual generated *content* is wrong: a flat, near-uniform color, not the chair.** Ran a
+systematic 2x2 isolation (guidance_scale 5.0 vs 1.0, real vs zeroed-out image conditioning) to
+localize the remaining bug:
+
+| guidance_scale | image conditioning | final_latents (mean / std) | visual result |
+|---|---|---|---|
+| 5.0 | real (both frames) | 1.76 / 4.79 | flat olive-green blob |
+| 1.0 | real (both frames) | 0.56 / 1.59 | high-frequency static/noise, unconverged |
+| 5.0 | zeroed | 1.33 / 4.96 | flat blob, same pattern as real |
+| 1.0 | zeroed | 0.53 / 1.72 | static/noise, same pattern as real |
+
+**Clean conclusion: image-conditioning content has negligible effect on the failure pattern** —
+zeroing it out changes the result by noise-level amounts, not qualitatively. This rules out
+`_concat_image_conditioning`'s mask/padding policy (the piece flagged as "best-effort,
+unconfirmed" since it was first written) as the primary suspect, at least for this failure mode.
+The failure instead tracks `guidance_scale` cleanly: high CFG diverges to flat saturation, CFG=1
+(single conditional pass only, no combination at all) still fails to converge to a clean image,
+just in a different way (looks like insufficiently-denoised noise). Since CFG=1 uses *only* the
+conditional forward pass — no `uncond`/combination math involved at all — this points at
+something in the single-pass DiT conditional output itself not being quite right, independent of
+the CFG formula.
+
+**Verified NOT the bug, to narrow the search:**
+- The CFG combination formula (`uncond_out + guidance_scale*(cond_out-uncond_out)` on raw
+  velocity, done in `DiTEngine.denoise_step`) is mathematically equivalent to combining on
+  `calculate_denoised`-style x0 estimates instead (verified algebraically against ComfyUI's real
+  `CONST.calculate_denoised` — `model_input - model_output*sigma` — since that transform is
+  linear in `model_output`, combining before or after it commutes). Not a CFG-formula bug.
+  Not the image-conditioning content, per the table above.
+- `FlowMatchEulerScheduler`'s sigma schedule (`shift*sigma/(1+(shift-1)*sigma)` over a linear
+  `[1,0]` ramp) matches ComfyUI's real `time_snr_shift`/`ModelSamplingDiscreteFlow.sigma` formula
+  exactly (`comfy/model_sampling.py`) — checked directly against source, not assumed. `shift=5.0`
+  specifically isn't confirmed as Wan's exact default (not statically hardcoded anywhere found in
+  `supported_models.py`; workflow-configurable in practice), so it's *a* plausible remaining
+  variable, just not a formula-level bug.
+
+## Shift sweep and the decisive eager-vs-TensorRT comparison
+
+**`shift` ruled out too.** Swept `shift` in `[1.0, 2.0, 3.0, 5.0, 8.0]` (real image conditioning,
+`guidance_scale=1.0`, same prompt/images, one engine-load session reused across all five —
+`/workspace/runpod-slim/i2v_shift_sweep.py`, scratch). Every value converged to nearly identical
+`final_latents` stats (mean 0.53–0.57, std 1.50–1.61 — a tight cluster) and visually identical
+high-frequency noise/static output. `shift` is not the cause. Each full run (20 steps + decode)
+took only 2–7 seconds at this resolution — engine loading (~3.5min for all four, ~49GB) was the
+actual dominant cost, not generation itself.
+
+**The decisive check: does the built DiT TensorRT engine match the real eager PyTorch model?**
+Two-phase script (`save_conditioning.py` + `compare_eager_vs_trt.py`, scratch): phase 1 used the
+already-built text_encoder/vae_encoder engines to compute and save real `text_embeds`,
+`first_frame_latent`, `last_frame_latent`, and a fixed-seed `initial_latents` to disk. Phase 2
+built `x` (36-channel: noise++image_latent++mask, identical construction to
+`DiTEngine._concat_image_conditioning`) at `timestep=1000.0` (the first denoising step — where
+the earlier NaN investigation focused), then ran **both** the DiT TensorRT engine and
+`load_dit()`'s real eager 14.29B-param checkpoint on the exact same input tensors and compared:
+
+```
+max_abs_diff=0.0137   rel_err=0.35%   cosine_similarity=0.999995
+```
+
+**This is essentially a perfect match** — well within normal fp16 numerical noise, not a
+divergence. **Conclusively rules out the export/build pipeline as the source of the content-quality
+bug**: the RoPE interleaved-pair fix, decomposed attention (avoiding TensorRT's native-Attention-op
+dead end), and the rest of the export chain are all numerically verified correct — the built
+DiT engine faithfully reproduces the real checkpoint's computation for this input.
+
+**This flips the investigation.** Since eager and TensorRT agree almost exactly on this exact
+input, and that input still produces incoherent output end-to-end, the remaining bug cannot be in
+engine conversion — it has to be in what gets fed to the model. Both eager and TensorRT would
+be equally "confused" by a semantically-wrong input and produce equally wrong (but
+mutually-consistent, as observed) output. The prime remaining suspect is exactly the piece
+flagged as unconfirmed since `_concat_image_conditioning` was first written: the real
+`WanImageToVideo` node's image_latent/mask construction (pixel-space gray-fill before a full-video
+VAE encode, real per-channel mask semantics) was never located or read in this environment — this
+repo's zero-padding + binary-mask policy is a plausible-shaped guess, not a confirmed match, and
+is now the single most likely remaining explanation for bad generation quality.
+
+## Found and fixed: real channel-order bug — first genuinely coherent output
+
+Located the real node: `comfy_extras/nodes_wan.py`'s `WanImageToVideo` (the official/canonical
+one — `grep -rl "class WanImageToVideo"` also turned up two custom-node forks, ignored). Its
+`execute()` builds the mask/image-latent conditioning values but does **not** itself
+channel-concatenate them onto the DiT's `x` — that happens later, in `WAN21.concat_cond`
+(`comfy/model_base.py`), which is what actually matters for matching this repo's
+`_concat_image_conditioning`.
+
+**Real channel order, read directly from `concat_cond`:**
+```python
+mask = 1.0 - mask  # WanImageToVideo produces 0=known/1=to-generate; this inverts it
+...
+return torch.cat((mask, image), dim=1)  # then concatenated after noise: noise ++ mask ++ image
+```
+i.e. **`noise(16) ++ mask(4) ++ image_latent(16)`** — mask *before* image latent.
+`_concat_image_conditioning` had `noise ++ image_latent ++ mask` (image before mask) since it was
+first written, always flagged as an unconfirmed guess. **This was the real bug**: with the order
+reversed, the model's mask-weight-slice and image-latent-weight-slice were being fed entirely
+each other's data — structurally consistent with every generation attempt producing zero
+coherent structure regardless of CFG, shift, or image content, exactly the "garbage in" signature
+the eager-vs-TensorRT comparison pointed at (engine verified correct; input to the engine wasn't).
+
+Mask *polarity*, traced through both `WanImageToVideo` and `concat_cond`'s inversion, nets out to
+1=known/0=to-generate — which is what this repo already implemented. Not a bug, despite looking
+backwards at a glance against the node alone.
+
+Still confirmed-but-unfixed: `WanImageToVideo` gray-fills (pixel value 0.5) every frame without a
+real reference *before* VAE-encoding the whole padded video in one call — so its "padding" latent
+frames are whatever the VAE produces for gray input, not zero. `_concat_image_conditioning` still
+zero-pads directly in latent space. Smaller-magnitude than the channel-order bug, not yet fixed
+or measured.
+
+**Fixed** (`engine/dit_engine.py`'s `_concat_image_conditioning`): swapped concatenation order to
+`torch.cat([x, mask, full_image_latent], dim=1)`.
+
+**Re-ran the real prompt/images end to end (guidance_scale=5.0, real image conditioning) — first
+genuinely coherent output of the whole project.** `final_latents` stats transformed completely:
+mean=0.05, std=1.10 (vs. mean=1.76, std=4.79 with the channel-order bug) — stable, well-behaved
+values throughout all 20 steps rather than runaway drift. Decoded frames show real spatial
+structure for the first time: a dark rectangular band in the chair's position/shape against a
+lighter wall background with vertical line detail (matching the window/pipe visible in the
+source photos), consistent across all 9 output frames, not a one-off. Still low quality (20
+steps, 256×256 test resolution, unfixed gray-fill-padding discrepancy above, mask/frame-index
+semantics for `first_frame`/`last_frame` still not independently confirmed beyond "the obvious
+reading of the kind's name") — but structurally working for the first time, a fundamentally
+different result from every flat-blob/static-noise attempt before it.
+
+**Not yet done:** higher step count / full resolution / quality comparison against a real
+ComfyUI-generated reference video; the gray-fill-padding fix; independent confirmation of the
+first_frame=index-0/last_frame=index-(-1) temporal convention.

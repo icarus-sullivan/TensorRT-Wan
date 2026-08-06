@@ -39,8 +39,8 @@ assume GPU hardware is present (PLAN.md's development rule).
 
 ## Numerical validation status
 
-The kernels in this repository (RoPE rotate-half, AdaLN-Zero, sinusoidal timestep embedding,
-patch embed/reconstruct as tiled linear projections, nearest-neighbor temporal resize, standard
+The kernels in this repository (AdaLN-Zero, sinusoidal timestep embedding, patch
+embed/reconstruct as tiled linear projections, nearest-neighbor temporal resize, standard
 activation formulas) implement the generic, well-established versions of each operation as used
 across the DiT model family. **None have been validated against Wan's specific reference
 implementation** — this repository was built without access to Wan's own source (see
@@ -48,14 +48,16 @@ implementation** — this repository was built without access to Wan's own sourc
 
 1. Build each plugin's op in isolation and compare against the equivalent PyTorch op on the same
    input, per RoPE/AdaLN/etc.
-2. **`rotary_embedding` is confirmed wrong, not just unvalidated:** it implements rotate-half,
-   but ComfyUI's real Wan implementation (`comfy/ldm/flux/math.py`'s `_apply_rope1`, called
-   directly by `comfy/ldm/wan/model.py`) uses interleaved-pair rotation instead — confirmed by
-   reading the actual source on RunPod hardware, see
+2. **`rotary_embedding` was confirmed wrong and has been rewritten, but still needs numeric
+   validation:** it previously implemented rotate-half, while ComfyUI's real Wan implementation
+   (`comfy/ldm/flux/math.py`'s `_apply_rope1`, called directly by `comfy/ldm/wan/model.py`) uses
+   interleaved-pair rotation — confirmed by reading the actual source on RunPod hardware, see
    [wan2.2_i2v_14b_notes.md](wan2.2_i2v_14b_notes.md#onnx-export-rmsnorm-and-rope-both-needed-fixes).
-   `examples/loaders/wan_comfyui_loader.py`'s cloned `_apply_rope1` is the reference to rewrite
-   `kernel.cu` against. Also check `patch_embed`/`patch_reconstruct` (patch ordering conventions
-   vary too, not yet confirmed either way).
+   `kernel.cu` now rotates adjacent pairs (x[2i], x[2i+1]) per `_apply_rope1`'s math, matching
+   `examples/loaders/wan_comfyui_loader.py`'s cloned reference — still needs a build + isolated
+   numeric comparison against that reference on GPU hardware before it's trusted in an engine.
+   Also check `patch_embed`/`patch_reconstruct` (patch ordering conventions vary too, not yet
+   confirmed either way).
 3. `custom_attention` has no backend wired up at all yet (see
    [`custom_attention/kernel_dispatch.cpp`](../tensorrt_wan/plugins/csrc/custom_attention/kernel_dispatch.cpp))
    — it raises rather than silently computing something wrong.

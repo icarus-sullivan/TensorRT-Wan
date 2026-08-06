@@ -1,9 +1,9 @@
 """On-disk TensorRT engine cache with automatic invalidation.
 
-An engine is only valid for the exact (model, TensorRT version, CUDA version, GPU architecture,
-optimization profile, precision) tuple it was built for. Loading a stale engine silently would
-be a correctness bug (wrong precision) or a crash (arch mismatch), so `EngineCache` keys strictly
-on all six and never returns a partial/best-effort match.
+An engine is only valid for the exact (component, model, TensorRT version, CUDA version, GPU
+architecture, optimization profile, precision) tuple it was built for. Loading a stale engine
+silently would be a correctness bug (wrong precision) or a crash (arch mismatch), so `EngineCache`
+keys strictly on all seven and never returns a partial/best-effort match.
 """
 
 from __future__ import annotations
@@ -20,6 +20,11 @@ logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class CacheKey:
+    # Confirmed necessary against a real collision on RunPod hardware: `vae_encoder` and
+    # `vae_decoder` share one checkpoint file (same `model_hash`) and can easily share the same
+    # profile/precision too — without `component`, a decoder build silently got served the
+    # encoder's cached engine instead of building its own. See docs/wan2.2_i2v_14b_notes.md.
+    component: str
     model_hash: str
     tensorrt_version: str
     cuda_version: str
