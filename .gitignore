@@ -10,6 +10,8 @@ venv/
 .pytest_cache/
 .ruff_cache/
 
+runpod_*/
+
 # Generated artifacts (never committed — produced by export/build pipeline at runtime)
 *.onnx
 *.engine
