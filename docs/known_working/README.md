@@ -62,6 +62,38 @@ See the script itself for full comments, summarized:
 Visually confirmed coherent (a recognizable green chair matching the source image) across first,
 middle, and last frames.
 
+## Pinned engine copies (do not rely on the mutable cache/symlinks for this)
+
+`trtwan_engines/`'s content-addressed cache and `trtwan_model/*.engine`'s symlinks are both
+mutable — confirmed the hard way same day (2026-08-08): a `vae_encoder.engine` symlink silently
+pointed at a stale, incompatible build after an unrelated exporter change, with no error until
+runtime OOM. To make sure this exact known-good result can always be reproduced regardless of
+what else gets built later, the two DiT engines that produced it are copied (not symlinked),
+read-only, to a name that nothing else will ever write to:
+
+```
+/workspace/runpod-slim/trtwan_known_working_engines/dit_high_noise_c56f29a277b8a35a_480x832_bf16.engine
+/workspace/runpod-slim/trtwan_known_working_engines/dit_low_noise_7d16ae577fe5bc92_480x832_bf16.engine
+```
+
+Sidecar `.json` (component/model_hash/tensorrt_version/cuda_version/gpu_architecture/
+optimization_profile/precision/input_shape_digest) copied alongside each, unchanged from the
+original cache entry:
+
+- high_noise: `model_hash=c21c21efa368d529`, `input_shape_digest=b8f95a1c8b28`, `precision=bf16`, `optimization_profile=480x832`
+- low_noise: `model_hash=edb89340c8a6fbf1`, `input_shape_digest=b8f95a1c8b28`, `precision=bf16`, `optimization_profile=480x832`
+
+`scripts/deploy_comfyui_integration.sh` (no `--latest` flag) always relinks
+`trtwan_model/dit_{high,low}_noise.engine` to these pinned files before pointing the example
+workflow at them — this is the safe default. Only pass `--latest` if you deliberately want to
+test a freshly-built DiT engine instead.
+
+Note: `vae_encoder.engine`/`vae_decoder.engine`/`text_encoder.engine` are **not** part of this
+known-good reference — the real ComfyUI pipeline uses its own CLIP/VAE, not this project's
+engines, for everything except the DiT. Those three engines only matter for the standalone
+`WanEngine.generate()` path, which is still producing noise (see wan2.2_i2v_14b_notes.md) and is
+not currently the recommended path.
+
 ## Next step (in progress at time of writing)
 
 Formalize this as a real ComfyUI custom node (`comfyui/nodes/`) outputting a standard `MODEL`
