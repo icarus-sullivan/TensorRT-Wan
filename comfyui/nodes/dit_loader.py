@@ -24,12 +24,57 @@ workflow.
 from __future__ import annotations
 
 import torch
+from safetensors import safe_open
 
+import comfy.model_base
 import comfy.model_management
 import comfy.sd
 import folder_paths
 
 from tensorrt_wan.engine.base import TensorRTEngineWrapper
+
+_SAFETENSORS_DTYPES = {
+    "F16": torch.float16, "F32": torch.float32, "BF16": torch.bfloat16,
+    "F64": torch.float64, "I64": torch.int64, "I32": torch.int32,
+    "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool,
+}
+
+
+def _load_shell_fast(unet_path: str):
+    """Get a correctly-configured model shell (`model_sampling`/`latent_format`/`concat_keys`)
+    without reading the real ~28GB of weight data -- we only need those three attributes off the
+    result; `diffusion_model` itself gets replaced with `TensorRTDiTModule` right after this
+    returns, so the real weights would just be thrown away anyway.
+
+    Reads only safetensors headers (shape/dtype, no data -- ~0s for ~1100 tensors vs. ~100s for a
+    full mmap+copy read) into `torch.empty(..., device="meta")` placeholders, then feeds those into
+    ComfyUI's real `load_diffusion_model_state_dict` (same model-config detection path a real load
+    uses). That function's `BaseModel.load_model_weights` tries a real `.copy_()` into our meta
+    tensors regardless (`assign` comes from `model_patcher.is_dynamic()`, which is hardcoded
+    `False` on this ComfyUI version's `CoreModelPatcher` -- an alias to plain `ModelPatcher`, not
+    the dynamic subclass, so it's never `True` here) and fails ("Cannot copy out of meta tensor;
+    no data!"). Since we don't need that copy to succeed, `load_model_weights` is no-op'd for the
+    duration of this one call rather than fighting the meta-tensor copy. Confirmed 2026-08-08 via
+    `scripts/prototype_fast_shell_load.py`: identical `model_sampling.shift`/`latent_format`/
+    `concat_keys`/`patch_embedding` shape to the real load, ~2300x faster.
+    """
+    with safe_open(unet_path, framework="pt", device="cpu") as f:
+        metadata = f.metadata()
+        fake_sd = {}
+        for k in f.keys():
+            slice_ = f.get_slice(k)
+            dtype = _SAFETENSORS_DTYPES.get(slice_.get_dtype(), torch.float32)
+            fake_sd[k] = torch.empty(slice_.get_shape(), dtype=dtype, device="meta")
+
+    orig_load_model_weights = comfy.model_base.BaseModel.load_model_weights
+    comfy.model_base.BaseModel.load_model_weights = lambda self, sd, unet_prefix="", assign=False: self
+    try:
+        model = comfy.sd.load_diffusion_model_state_dict(fake_sd, model_options={}, metadata=metadata)
+    finally:
+        comfy.model_base.BaseModel.load_model_weights = orig_load_model_weights
+    if model is None:
+        raise RuntimeError(f"Could not detect model type of: {unet_path}")
+    return model
 
 
 class TensorRTDiTModule(torch.nn.Module):
@@ -115,12 +160,23 @@ class TensorRTDiTLoader:
                 "engine_path": ("STRING", {"default": ""}),
                 "in_channels": ("INT", {"default": 36, "min": 1, "max": 256}),
                 "max_text_tokens": ("INT", {"default": 512, "min": 1, "max": 8192}),
+                "fast_shell_load": ("BOOLEAN", {"default": True}),
             }
         }
 
-    def load(self, unet_name: str, engine_path: str, in_channels: int, max_text_tokens: int):
+    def load(
+        self,
+        unet_name: str,
+        engine_path: str,
+        in_channels: int,
+        max_text_tokens: int,
+        fast_shell_load: bool = True,
+    ):
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
-        model = comfy.sd.load_diffusion_model(unet_path, model_options={})
+        if fast_shell_load:
+            model = _load_shell_fast(unet_path)
+        else:
+            model = comfy.sd.load_diffusion_model(unet_path, model_options={})
         model.model.diffusion_model = TensorRTDiTModule(
             engine_path, in_channels=in_channels, max_text_tokens=max_text_tokens
         )

@@ -19,6 +19,7 @@ from safetensors import safe_open
 COMFYUI_ROOT = "/workspace/runpod-slim/ComfyUI"
 sys.path.insert(0, COMFYUI_ROOT)
 
+import comfy.model_base  # noqa: E402
 import comfy.sd  # noqa: E402
 import comfy.utils  # noqa: E402
 
@@ -53,8 +54,21 @@ with safe_open(ckpt_path, framework="pt", device="cpu") as f:
 t_header = time.monotonic() - t0
 print(f"\nHeader-only read ({len(fake_sd)} tensors): {t_header:.1f}s")
 
+# load_diffusion_model_state_dict -> BaseModel.load_model_weights -> diffusion_model.load_state_dict(assign=...)
+# `assign` comes from model_patcher.is_dynamic(), which is hardcoded False on this ComfyUI
+# version's CoreModelPatcher (an alias to plain ModelPatcher, not the dynamic subclass) -- so this
+# always tries a real .copy_() into our meta placeholders and fails ("Cannot copy out of meta
+# tensor; no data!"). We don't need the copy to succeed at all: the caller only wants
+# model_sampling/latent_format/concat_keys off the resulting shell, then discards
+# `diffusion_model` entirely in favor of our own TensorRT wrapper. No-op the weight-copy step for
+# the duration of this one call instead of fighting the meta-tensor copy.
+_orig_load_model_weights = comfy.model_base.BaseModel.load_model_weights
+comfy.model_base.BaseModel.load_model_weights = lambda self, sd, unet_prefix="", assign=False: self
 t0 = time.monotonic()
-fast_model = comfy.sd.load_diffusion_model_state_dict(fake_sd, model_options={}, metadata=metadata)
+try:
+    fast_model = comfy.sd.load_diffusion_model_state_dict(fake_sd, model_options={}, metadata=metadata)
+finally:
+    comfy.model_base.BaseModel.load_model_weights = _orig_load_model_weights
 t_fast = time.monotonic() - t0
 print(f"FAST load_diffusion_model_state_dict (meta tensors): {t_fast:.1f}s")
 if fast_model is None:
