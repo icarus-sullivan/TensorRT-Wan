@@ -33,7 +33,7 @@ cp "$REPO_ROOT/comfyui/examples/tensorrt_wan_i2v_example.json" \
 echo "== 3/4: copying input images =="
 mkdir -p "$COMFYUI_ROOT/input"
 for f in "$INPUT_IMAGE_DIR"/close_green_chair_start.png "$INPUT_IMAGE_DIR"/close_green_chair_end.png; do
-  [ -f "$f" ] && cp -n "$f" "$COMFYUI_ROOT/input/" || true
+  [ -f "$f" ] && cp --update=none "$f" "$COMFYUI_ROOT/input/" || true
 done
 
 echo "== 4/4: pointing dit_{high,low}_noise.engine =="
