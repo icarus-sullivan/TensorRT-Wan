@@ -31,6 +31,14 @@ class CacheKey:
     gpu_architecture: str
     optimization_profile: str
     precision: str
+    # Confirmed necessary against a second, real collision: `optimization_profile` is a *name*
+    # string (e.g. "480x832"), not the exporter's actual traced shape — two builds of the same
+    # component/profile-name but different exporter-kwargs (e.g. VAEEncoderExporter's `frames=1`
+    # vs `frames=81`) hash identically and silently overwrite each other's cache entry, even
+    # though the underlying ONNX graphs (and what shapes the resulting engine actually accepts)
+    # are completely different. Hit for real on 2026-08-06: a `frames=1` test build clobbered a
+    # previous `frames=9` engine under the same digest. See docs/wan2.2_i2v_14b_notes.md.
+    input_shape_digest: str = ""
 
     def digest(self) -> str:
         payload = json.dumps(asdict(self), sort_keys=True).encode()

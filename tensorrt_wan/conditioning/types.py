@@ -19,6 +19,7 @@ class ConditioningKind(str, Enum):
     IMAGE = "image"
     FIRST_FRAME = "first_frame"
     LAST_FRAME = "last_frame"
+    IMAGE_VIDEO = "image_video"  # prebuilt full-length image_latent+mask pair, see api/wan_engine.py
     CONTROL = "control"
     IP_ADAPTER = "ip_adapter"
     LORA = "lora"

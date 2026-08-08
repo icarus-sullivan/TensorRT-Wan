@@ -27,12 +27,31 @@ class VAEEncoderExporter(ModelExporter):
         frames: int = 1,
         height: int = 480,
         width: int = 832,
+        min_height: int = 256,
+        max_height: int = 1088,
+        min_width: int = 256,
+        max_width: int = 1088,
+        static: bool = False,
     ) -> None:
-        super().__init__(model)
+        super().__init__(model, static=static)
         self.latent_channels = latent_channels
         self.frames = frames
         self.height = height
         self.width = width
+        # Narrower than DiT's [256, 1280] -- confirmed via a real OOM (2026-08-08) that this
+        # engine's execution context sizes scratch memory for the profile's *worst-case* bound at
+        # context-creation time, not the actual runtime shape requested (same failure class
+        # runpod_setup.md already documented for a wide vae_decoder profile). [256, 1280] requested
+        # 103GiB and failed at *every* shape, including the previously-working 480x832 opt point --
+        # this project's DiT does not have this problem at the same [32,160]-latent range (directly
+        # confirmed working), so it's specific to this VAE architecture/TensorRT's scratch-sizing
+        # for it, not a general dynamic-profile issue. 1088 covers both real target shapes
+        # (480x832, 720x1088); narrow further if this still OOMs. See
+        # docs/wan2.2_i2v_14b_notes.md, 2026-08-08.
+        self.min_height = min_height
+        self.max_height = max_height
+        self.min_width = min_width
+        self.max_width = max_width
 
     def example_inputs(self) -> dict[str, torch.Tensor]:
         return {
@@ -51,10 +70,12 @@ class VAEEncoderExporter(ModelExporter):
         # genuinely T-dynamic engine. A different `frames` value needs its own export/engine,
         # same "static per profile" strategy PLAN.md already treats as first-class. Only
         # height/width remain dynamic, matching what's actually true of the exported graph.
+        if self.static:
+            return {}
         return {
             "pixels": [
-                DynamicAxis(name="dim3", min=64, opt=self.height, max=1920),
-                DynamicAxis(name="dim4", min=64, opt=self.width, max=1920),
+                DynamicAxis(name="dim3", min=self.min_height, opt=self.height, max=self.max_height),
+                DynamicAxis(name="dim4", min=self.min_width, opt=self.width, max=self.max_width),
             ]
         }
 
@@ -77,12 +98,29 @@ class VAEDecoderExporter(ModelExporter):
         latent_frames: int = 21,
         latent_height: int = 60,
         latent_width: int = 104,
+        min_latent_height: int = 32,
+        max_latent_height: int = 136,
+        min_latent_width: int = 32,
+        max_latent_width: int = 136,
+        static: bool = False,
     ) -> None:
-        super().__init__(model)
+        super().__init__(model, static=static)
         self.latent_channels = latent_channels
         self.latent_frames = latent_frames
         self.latent_height = latent_height
         self.latent_width = latent_width
+        # Narrower than DiT's [32, 160] latent range -- confirmed via a real OOM (2026-08-08) that
+        # this VAE's execution context sizes scratch for the profile's worst-case bound at
+        # context-creation time regardless of actual runtime shape (same class of failure
+        # runpod_setup.md already documented; DiT does not have this problem at the wider range,
+        # confirmed working directly, so it's VAE-specific). [32,160] (1280px) requested 103GiB and
+        # OOM'd at *every* shape including the previously-working 480x832 opt point. 136 (1088px)
+        # covers both real target shapes (480x832, 720x1088); narrow further if this still OOMs.
+        # See docs/wan2.2_i2v_14b_notes.md, 2026-08-08.
+        self.min_latent_height = min_latent_height
+        self.max_latent_height = max_latent_height
+        self.min_latent_width = min_latent_width
+        self.max_latent_width = max_latent_width
 
     def example_inputs(self) -> dict[str, torch.Tensor]:
         return {
@@ -101,10 +139,18 @@ class VAEDecoderExporter(ModelExporter):
         # symptom would be TensorRT's "Dimension mismatch ... profile has min=...,max=... but
         # tensor has N" error, same as every other instance of this finding in this file. See
         # docs/wan2.2_i2v_14b_notes.md.
+        if self.static:
+            return {}
         return {
             "latent": [
-                DynamicAxis(name="dim3", min=32, opt=self.latent_height, max=self.latent_height * 2),
-                DynamicAxis(name="dim4", min=32, opt=self.latent_width, max=self.latent_width * 2),
+                DynamicAxis(
+                    name="dim3", min=self.min_latent_height, opt=self.latent_height,
+                    max=self.max_latent_height,
+                ),
+                DynamicAxis(
+                    name="dim4", min=self.min_latent_width, opt=self.latent_width,
+                    max=self.max_latent_width,
+                ),
             ]
         }
 

@@ -47,6 +47,19 @@ def test_different_component_is_a_different_cache_entry(tmp_path: Path):
     assert cache.get(_key(component="vae_decoder")) is None
 
 
+def test_different_input_shape_is_a_different_cache_entry(tmp_path: Path):
+    # Regression test: `optimization_profile` is a name string ("480x832"), not the exporter's
+    # actual traced shape -- two builds of the same component/profile-name but different
+    # exporter-kwargs (e.g. VAEEncoderExporter frames=1 vs frames=81) used to hash identically and
+    # silently overwrite each other's cache entry. Confirmed as a real bug on RunPod hardware
+    # (a frames=1 test build clobbered a working frames=9 engine) before `input_shape_digest` was
+    # added; see docs/wan2.2_i2v_14b_notes.md's 2026-08-06 session section.
+    cache = EngineCache(tmp_path)
+    cache.put(_key(input_shape_digest="frames=9"), b"nine-frame-engine")
+    assert cache.get(_key(input_shape_digest="frames=1")) is None
+    assert cache.get(_key(input_shape_digest="frames=9")) is not None
+
+
 def test_clear_removes_all_entries(tmp_path: Path):
     cache = EngineCache(tmp_path)
     cache.put(_key(model_hash="a"), b"engine-a")

@@ -22,6 +22,9 @@ class VAEEncoderEngine:
     def load(self) -> None:
         self._wrapper.load()
 
+    def unload(self) -> None:
+        self._wrapper.unload()
+
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
         """`image`: (B, C, H, W) in [-1, 1]. Returns a single-frame latent, (B, C_latent, 1, h, w).
 
@@ -51,6 +54,9 @@ class VAEDecoderEngine:
 
     def load(self) -> None:
         self._wrapper.load()
+
+    def unload(self) -> None:
+        self._wrapper.unload()
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
         """`latents`: (B, C, T, H, W). Returns pixel-space frames in [-1, 1]."""

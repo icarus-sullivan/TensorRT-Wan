@@ -46,7 +46,7 @@ class TensorRTWanLoader:
         config = WanModelConfig.load(model_dir_path / "wan_model.json")
         device = torch.device(f"cuda:{runtime.primary_gpu.index}") if runtime.primary_gpu else torch.device("cuda")
 
-        tokenizer = load_default_tokenizer(config.tokenizer_name)
+        tokenizer = load_default_tokenizer(config.tokenizer_name, config.max_text_tokens)
         text_encoder = TextEncoderEngine(model_dir_path / "text_encoder.engine", tokenizer, device=device)
         dit = DiTEngine(model_dir_path / "dit.engine", device=device)
         vae_encoder = VAEEncoderEngine(model_dir_path / "vae_encoder.engine", device=device)

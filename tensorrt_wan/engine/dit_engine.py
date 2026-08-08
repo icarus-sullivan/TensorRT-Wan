@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-from tensorrt_wan.conditioning.types import UnifiedConditioning
+from tensorrt_wan.conditioning.types import ConditioningKind, UnifiedConditioning
 from tensorrt_wan.engine.base import TensorRTEngineWrapper
 from tensorrt_wan.scheduler.base import Scheduler
 from tensorrt_wan.utils.logging import get_logger
@@ -36,9 +36,19 @@ _ENGINE_INPUT_NAME_BY_EMBEDDING_KEY = {"text": "context"}
 # Which side of the temporal axis each image-conditioning kind occupies once concatenated into
 # `x` — confirmed channel order is noise(16) ++ mask(4) ++ image_latent(16), verified directly
 # against ComfyUI's `WAN21.concat_cond` (comfy/model_base.py), see _concat_image_conditioning's
-# docstring; which *temporal* frame index each kind conditions is the obvious reading of the
-# kind's name, not independently confirmed against ComfyUI source.
+# docstring. Temporal frame index (first_frame=0, last_frame=-1) is now independently confirmed
+# too, against `WanFirstLastFrameToVideo.execute()` (comfy_extras/nodes_wan.py):
+# `image[:start_image.shape[0]] = start_image` / `image[-end_image.shape[0]:] = end_image`.
 _IMAGE_CONDITIONING_FRAME_INDEX = {"first_frame": 0, "last_frame": -1}
+
+# `api/wan_engine.py`'s standalone-API path builds the full-length image_latent/mask pair itself
+# (real gray-fill + single vae.encode over the whole padded video, matching
+# `WanFirstLastFrameToVideo` exactly) and hands it over already-complete under this one kind —
+# skip the zero-pad/single-frame placement logic below entirely for it. The ComfyUI node-graph
+# path (comfyui/nodes/vae_encoder.py's `TensorRTVAEEncoder`, one node per frame with no visibility
+# into the target video length) can't build that yet and still goes through
+# `_IMAGE_CONDITIONING_FRAME_INDEX`'s legacy zero-pad path below — see docs/roadmap.md.
+_PREBUILT_IMAGE_VIDEO_KEY = ConditioningKind.IMAGE_VIDEO.value
 
 
 class DiTEngine:
@@ -64,19 +74,29 @@ class DiTEngine:
     def load(self) -> None:
         self._wrapper.load()
 
+    def unload(self) -> None:
+        self._wrapper.unload()
+
     def denoise_step(
         self,
         latents: torch.Tensor,
         timestep: torch.Tensor,
         conditioning: UnifiedConditioning,
         guidance_scale: float = 1.0,
+        uncond_conditioning: UnifiedConditioning | None = None,
     ) -> torch.Tensor:
         """Run one DiT forward pass and return the predicted velocity/noise for this timestep.
 
         `guidance_scale > 1.0` runs classifier-free guidance as two batched engine calls (one
-        with `conditioning` as given, one with the text embedding zeroed) rather than one
-        double-batch call, so a single optimization profile covers both the guided and
-        unguided case.
+        with `conditioning` as given, one unconditional) rather than one double-batch call, so a
+        single optimization profile covers both the guided and unguided case.
+
+        `uncond_conditioning`, if given, is used as-is for the unconditional pass -- callers with
+        access to a text encoder should build this from a real *empty-string* encoding (see
+        `_null_conditioning`'s docstring for why an all-zero embedding is the wrong default) and
+        pass it in. Falls back to `_null_conditioning(conditioning)` (zeroing the text embedding)
+        only when the caller can't provide a real one -- e.g. no text encoder in scope at this
+        call site.
         """
         cond_inputs = self._build_inputs(latents, timestep, conditioning)
         cond_out = self._wrapper.infer(cond_inputs)["noise_pred"]
@@ -84,7 +104,8 @@ class DiTEngine:
         if guidance_scale == 1.0:
             return cond_out
 
-        uncond_conditioning = _null_conditioning(conditioning)
+        if uncond_conditioning is None:
+            uncond_conditioning = _null_conditioning(conditioning)
         uncond_inputs = self._build_inputs(latents, timestep, uncond_conditioning)
         uncond_out = self._wrapper.infer(uncond_inputs)["noise_pred"]
 
@@ -123,7 +144,20 @@ class DiTEngine:
         image_kinds = {
             kind: embeddings.pop(kind) for kind in _IMAGE_CONDITIONING_FRAME_INDEX if kind in embeddings
         }
-        x = _concat_image_conditioning(latents, image_kinds) if image_kinds else latents
+        prebuilt_image_video = embeddings.pop(_PREBUILT_IMAGE_VIDEO_KEY, None)
+        if prebuilt_image_video is not None and image_kinds:
+            raise NotImplementedError(
+                "Both prebuilt image_video conditioning and legacy first_frame/last_frame "
+                "conditioning were present in the same UnifiedConditioning — these are two "
+                "different callers' conventions and shouldn't mix."
+            )
+        if prebuilt_image_video is not None:
+            mask = conditioning.masks[_PREBUILT_IMAGE_VIDEO_KEY]
+            x = torch.cat([latents, mask, prebuilt_image_video], dim=1)
+        elif image_kinds:
+            x = _concat_image_conditioning(latents, image_kinds)
+        else:
+            x = latents
 
         unsupported = set(embeddings) - set(_ENGINE_INPUT_NAME_BY_EMBEDDING_KEY)
         if unsupported:
@@ -147,13 +181,23 @@ class DiTEngine:
             if embedding_key in embeddings:
                 inputs[engine_name] = embeddings[embedding_key]
         for key, mask in conditioning.masks.items():
-            if key not in _IMAGE_CONDITIONING_FRAME_INDEX:
+            if key not in _IMAGE_CONDITIONING_FRAME_INDEX and key != _PREBUILT_IMAGE_VIDEO_KEY:
                 inputs[f"{key}_mask"] = mask
         return inputs
 
 
 def _concat_image_conditioning(x: torch.Tensor, image_kinds: dict[str, torch.Tensor]) -> torch.Tensor:
-    """Channel-concatenates every present image-conditioning kind onto `x`, matching Wan's real
+    """**Legacy/ComfyUI-graph path only** — the standalone `WanEngine` API no longer calls this
+    (see `_PREBUILT_IMAGE_VIDEO_KEY` above and `api/wan_engine.py`'s
+    `_build_image_to_video_conditioning`, which builds the real gray-fill + single-vae-encode
+    conditioning and bypasses this function's placement logic entirely). Still used by
+    `comfyui/nodes/vae_encoder.py`'s `TensorRTVAEEncoder` node, which encodes one frame per node
+    call with no visibility into the target video's full length — it can't build the real
+    algorithm's padded-video encode, so this function's zero-pad approximation remains its only
+    option until a joint ComfyUI node (mirroring `WanFirstLastFrameToVideo`'s single-node,
+    both-frames-plus-length signature) exists. See docs/roadmap.md.
+
+    Channel-concatenates every present image-conditioning kind onto `x`, matching Wan's real
     `noise(16) ++ mask(4) ++ image_latent(16)` channel layout — confirmed by reading
     `WAN21.concat_cond` in ComfyUI's own `comfy/model_base.py` directly (`comfy_extras/
     nodes_wan.py`'s `WanImageToVideo` builds the mask/image separately; `concat_cond` is what
@@ -177,12 +221,13 @@ def _concat_image_conditioning(x: torch.Tensor, image_kinds: dict[str, torch.Ten
     before concatenating — net result 1=known/0=to-generate, which is what this function already
     produced. Traced through both stages to confirm rather than assumed.
 
-    Also confirmed via `concat_cond`, still not implemented here: `WanImageToVideo` gray-fills
+    Also confirmed via `concat_cond`: `WanImageToVideo`/`WanFirstLastFrameToVideo` gray-fill
     (pixel value 0.5) every frame without a real reference image *before* VAE-encoding the whole
     padded video in one call, so the "padding" latent frames are whatever the VAE produces for
-    gray input — not zero. This function still zero-pads in latent space directly. Likely a
-    smaller-magnitude discrepancy than the channel-order bug was, but not yet fixed or measured;
-    worth revisiting once the channel-order fix's actual effect on output quality is confirmed.
+    gray input — not zero. This function still zero-pads in latent space directly (real fix now
+    lives in `api/wan_engine.py`'s `_build_image_to_video_conditioning` for the standalone path;
+    this function keeps the zero-pad approximation for the ComfyUI-graph path only, see this
+    function's docstring header).
 
     `image_kinds`: e.g. `{"first_frame": (B, C_vae, 1, H, W), "last_frame": (B, C_vae, 1, H, W)}`
     — each value a single encoded frame (`VAEEncoderEngine.encode_image`'s output), not yet
@@ -206,9 +251,21 @@ def _concat_image_conditioning(x: torch.Tensor, image_kinds: dict[str, torch.Ten
 
 
 def _null_conditioning(conditioning: UnifiedConditioning) -> UnifiedConditioning:
-    """Zero the text embedding for the unconditional CFG pass; other conditioning (image,
-    control, IP-Adapter) is left as-is, matching Wan's own CFG convention of nulling only the
-    prompt embedding.
+    """Fallback-only: zero the text embedding for the unconditional CFG pass; other conditioning
+    (image, control, IP-Adapter) is left as-is.
+
+    Prefer passing a real `uncond_conditioning` (a genuine empty-string text encoding) to
+    `denoise_step()` instead of relying on this function when a text encoder is available at the
+    call site. Real CFG convention for T5-style text encoders (SD3/Flux/Wan): the unconditional
+    pass uses an actual empty-string encoding through the same tokenizer/embedding path, not an
+    all-zero tensor -- the model never saw an all-zero embedding during training, so it's
+    out-of-distribution input to cross-attention, and CFG's `uncond + scale*(cond-uncond)` formula
+    then amplifies whatever that produces. Confirmed via a real eager-mode test this session
+    (docs/wan2.2_i2v_14b_notes.md, 2026-08-07/08): swapping to a real empty-string embedding
+    produced a visibly smoother/more well-behaved prediction-magnitude trajectory across the
+    denoising schedule than zeroing did, though not sufficient alone to fix the broader
+    incoherent-output investigation that session was chasing. Kept as a fallback here (not removed)
+    for callers with no text encoder in scope (e.g. a raw `DiTEngine` used standalone).
     """
     if _NULL_TOKEN_KEY not in conditioning.embeddings:
         return conditioning

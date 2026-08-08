@@ -148,16 +148,187 @@ On RTX PRO 6000 Blackwell instances:
       256×256 test res) and mask polarity/gray-fill-padding details remain only partially
       confirmed (see below), but structurally working for the first time. See
       wan2.2_i2v_14b_notes.md's "Found and fixed: real channel-order bug" section.
-- [ ] Still open: the gray-fill-padding discrepancy (`WanImageToVideo` gray-fills pixel-space
-      before VAE-encoding the whole padded video in one call — this repo zero-pads directly in
-      latent space instead, likely smaller-magnitude than the channel-order bug was but
-      unmeasured), independent confirmation of the first_frame=index-0/last_frame=index-(-1)
-      temporal convention, a higher-step/full-resolution quality run, and the VAE 5D-unification
-      assumption in `export/exporters/vae.py` — all still unverified against real ComfyUI source
+- [x] **Gray-fill-padding discrepancy fixed for the standalone API.** Fetched
+      `WanFirstLastFrameToVideo.execute()` (`comfy_extras/nodes_wan.py`) directly from upstream
+      ComfyUI source and ported its real algorithm exactly:
+      `api/wan_engine.py`'s new `_build_image_to_video_conditioning` gray-fills (pixel value 0.5,
+      `0.0` in this repo's `[-1,1]` convention) the entire target-length pixel video, overwrites
+      real first/last frames, then VAE-encodes the whole padded video in one `encode_video` call
+      (so padding latent frames reflect the VAE's real causal-conv response to nearby real frames
+      instead of being exactly zero) and builds the mask at raw-frame granularity before
+      reshaping into 4 channels — reproducing a real, confirmed **asymmetry**: a single first
+      frame marks all 4 mask channels known at latent index 0 (aligns with a whole causal group),
+      but a single last frame only marks 1-of-4 channels known at the last latent index. `dit_engine.py`
+      gained a `ConditioningKind.IMAGE_VIDEO` fast path that concatenates this prebuilt pair
+      directly, bypassing the old zero-pad placement logic. **Scope note:** the ComfyUI node-graph
+      path (`comfyui/nodes/vae_encoder.py`'s `TensorRTVAEEncoder`, one node per frame with no
+      visibility into target video length) still can't build this and keeps the old zero-pad
+      approximation via `_concat_image_conditioning` — would need a joint node mirroring
+      `WanFirstLastFrameToVideo`'s single-node signature to fix. CPU-only shape/value tests added
+      (`tests/test_image_conditioning.py`, no GPU/model needed) verifying the asymmetric mask and
+      both dit_engine branches.
+- [x] **`vae_encoder` T>1 TensorRT build limitation — pivoted to a per-frame design instead of
+      root-causing the build failure.** `vae_encoder`'s TensorRT build fails with a "Could not find
+      any implementation" autotuner error on a `ForeignNode` (plausibly the VAE's bottleneck
+      self-attention, whose sequence length scales with `H*W`, interacting with the multi-chunk
+      cross-chunk-merge logic that only exists at `T>1`). Bisected across four (frames, resolution)
+      points — 9@256x256 works (matches last night), 9@480x832 fails, 21@256x256 fails, 1@480x832
+      works — a real complexity/size threshold scaling with *both* frame-count and resolution
+      jointly, not either alone; the project's actual target config (81 frames @ 480x832) is well
+      past it. Rather than root-cause the TensorRT failure itself (verbose/polygraphy per-node
+      output, adjusting `_decompose_attention_for_export()` for the multi-chunk path, build-flag
+      tuning — none attempted), `_build_image_to_video_conditioning` was rewritten to only ever
+      need the one config already proven to build: `T=1`. It now calls `encode_image` once per
+      *distinct* pixel content (gray, optionally first, optionally last — never once per output
+      latent frame) and reuses each result across every latent position with that content,
+      entirely avoiding the need for a large-`T` engine. **Correction to this bullet's earlier
+      framing:** initially described this as losing "cross-chunk causal blending," implying a
+      generation-quality cost — that conflated VAE-encode-time context with generation-time
+      temporal consistency, which is entirely the DiT's own full self-attention across the whole
+      sequence during denoising and is unaffected by how the input conditioning was encoded. The
+      real difference is narrower: padding-position latent *values* no longer pick up a faint trace
+      of a neighboring real frame the way the real algorithm's single whole-video encode would
+      produce; the `mask` channel already tells the DiT which positions are authoritative regardless.
+      Expected minor/second-order, consistent with the channel-order bug (the actual cause of every
+      incoherent-output attempt) having dwarfed this from the start. Also drops the real algorithm's
+      raw-frame-granularity mask asymmetry (a side effect specific to that joint chunked encode) —
+      now simply all-4-channels-known at a real frame's latent index, all-4-channels-unknown
+      elsewhere. Tests updated (`tests/test_image_conditioning.py`). See
+      docs/wan2.2_i2v_14b_notes.md's corrected section for full detail.
+- [x] **Real cache-key collision bug found and fixed while investigating the above.**
+      `CacheKey.optimization_profile` was a profile *name* string, not the exporter's actual
+      traced shape — two builds of the same component/profile-name but different exporter-kwargs
+      (`frames=1` vs `frames=9`) silently overwrote each other's cache entry. Confirmed for real:
+      a `frames=1` test build clobbered last night's working `frames=9` engine. Fixed via
+      `ModelExporter.shape_digest()` (`export/base.py`) + `CacheKey.input_shape_digest`
+      (`runtime/cache.py`), wired into both real `CacheKey` construction sites. Regression test:
+      `tests/test_cache.py::test_different_input_shape_is_a_different_cache_entry`. **Any engine
+      cached before this fix has ambiguous shape provenance and should be treated as untrustworthy
+      until rebuilt.** Also surfaced, not fixed: `cli/commands/build.py`'s `run_engine` duplicates
+      `export/pipeline.py`'s `run_export_pipeline` logic instead of calling it, despite that
+      module's docstring claiming the CLI and the ComfyUI builder node share this path — they've
+      diverged.
+- [x] **first_frame=index-0/last_frame=index-(-1) temporal convention independently confirmed**
+      against the same real source: `image[:start_image.shape[0]] = start_image` /
+      `image[-end_image.shape[0]:] = end_image`. Matches what this repo already had.
+- [x] Ran the full pipeline for real for the first time (2026-08-07): all four engines built,
+      assembled a `model_dir`, ran `WanEngine.generate()` end to end (480x832, 81 frames, 30 steps).
+      Found and fixed four more real, previously-undetected bugs along the way, all confirmed via
+      an eager-vs-TensorRT byte-identical-input comparison (same methodology as the first session's
+      decisive channel-order check):
+      1. `comfy/ldm/flux/math.py`'s `rope()` mixes `float32`/`float64` in one `Einsum` — fine under
+         eager's implicit promotion, fatal once `torch.export` freezes it. Fixed via a
+         `_rope_fp32` monkeypatch on `comfy.ldm.flux.layers.rope` (not `wan.model.rope` —
+         `EmbedND.forward()`, called unconditionally every DiT forward pass, resolves the name
+         against its own module).
+      2. `WanEngine._initial_latents()` defaulted to `float32` (`torch.randn` with no `dtype=`).
+      3. `_build_image_to_video_conditioning`'s `mask` used `dtype=reference.dtype` (the caller's
+         raw pixel dtype) instead of `dtype=image_latent.dtype` (the engine's actual output dtype).
+      4. The text encoder's `text_embeds` *output* binding came out `float32` despite a `fp16`
+         build — `_validate_precision` (`export/trt_build.py`) only ever checked network *inputs*,
+         never outputs; a T5 implementation detail (plausibly an fp32-for-stability LayerNorm)
+         slipped through undetected. Fixed both the specific case (`_TextEncoderWrapper` now casts
+         its return value explicitly) and the general gap (`_validate_precision` now checks
+         `network.get_output(i)` too).
+      Bugs 2-4 share a pattern: none of them *error* — `torch.cat` silently promotes to the wider
+      dtype rather than raising, so nothing surfaced until eager's strict dtype checking (or,
+      for bug 4, this specific validation gap) exposed them.
+      **After all four fixes: eager PyTorch produces completely clean output (zero NaN, sane
+      stats) on the exact same inputs the built TensorRT DiT engine still returns 100% NaN for.**
+      This conclusively isolates the remaining bug to the export/TensorRT-build pipeline itself —
+      not conditioning construction, which is now fully validated correct. Not yet localized
+      further (would need layer-by-layer activation comparison, not another single dtype-mismatch
+      hunt) — stopped to report back given the time invested. See
+      docs/wan2.2_i2v_14b_notes.md's latest session entries for full detail on each fix and the
+      final decisive comparison.
+- [x] Bisected the eager-vs-TensorRT divergence via activation-dump instrumentation (12 extra ONNX
+      graph outputs, evenly spaced, auto-skipping fp32-by-design islands): first NaN appears at
+      ~25% through the graph, on the main image-token stream, right around block 5's
+      self-attention. Cross-referencing the raw ONNX ops found the likely cause: `load_dit()`
+      never applied `_decompose_attention_for_export()` (unlike `load_text_encoder`/
+      `_load_wan_vae`) — a *deliberate* decision from session 1 ("the DiT's own attention already
+      finds a dedicated fused kernel with no such error"), but that observation was made at a tiny
+      768-token smoke-test scale, not today's real ~32,760-token target — the same
+      shape-dependent-TensorRT-correctness-gap pattern already proven for `vae_encoder` this
+      session. Applied the fix to `load_dit()` too; rebuilding/retesting — not yet confirmed. Also
+      ruled out: `comfy.ops.RMSNorm`'s dynamic-cast path (checked directly on the loaded model,
+      inactive — plain native `torch.nn.RMSNorm` is what actually runs). Added
+      `TRTWAN_BUILDER_OPT_LEVEL` (`export/trt_build.py`) along the way — cuts iteration rebuild
+      time roughly in half for debugging, never for a real deployment build (defaults to max
+      quality, `5`, explicitly). See docs/wan2.2_i2v_14b_notes.md's latest entries.
+- [x] **Root cause found and fix confirmed this session: build the DiT in `bf16`, not `fp16`.**
+      Full bisection chain: confirmed the attention-decomposition monkeypatch genuinely lands in
+      the exported graph but TensorRT still returns 100% NaN regardless (it re-fuses the decomposed
+      form back into essentially the same kernel — confirmed independently via an 88GiB OOM when
+      debug-tapping those nodes forces defusion); `STRICT_NANS` made no difference; **eager PyTorch
+      at the real ~32,760-token scale with native fused attention and the same trivial input came
+      back completely clean**, proving the model math itself is correct and this is TensorRT-kernel
+      -specific; bisected the NaN to inside block 0's self-attention specifically (not the
+      modulation/gate path). Tested query-chunked attention (breaking TensorRT's fusion
+      pattern-match) combined with `bf16` — clean. Isolated the two: **`fp16` + chunking alone is
+      still 100% NaN; `bf16` alone (no chunking) is also completely clean** (`nan_frac=0.0`,
+      realistic finite output matching the eager reference) — so `bf16`'s wider dynamic range is
+      the actual fix, not the chunking/fusion theory. Landed two real code changes:
+      `ModelExporter.dtype` (`export/base.py`) now follows `TRTWAN_LOADER_DTYPE` instead of being
+      hardcoded fp16 (needed for `bf16` builds to even be internally consistent). Query-chunking
+      was tried, confirmed unnecessary (isolated: `fp16`+chunked still NaN'd, `bf16` alone without
+      chunking didn't), and stripped back out per user decision. Hardened against silent
+      regression: `load_dit()` and `DiTExporter.dtype` now hardcode `bf16` unconditionally and
+      ignore `TRTWAN_LOADER_DTYPE` (warn if set to anything else) — unlike every other loader,
+      which still follows it normally. **Promoted to the real (non-debug) `trtwan_engines/` cache
+      and confirmed clean** at full `builder_optimization_level=5`. Also found, not yet fixed:
+      `CacheKey`'s `input_shape_digest` can't detect a traced-graph change that doesn't alter
+      declared input shapes — two different graphs silently shared one cache slot during this
+      session's isolation testing. See wan2.2_i2v_14b_notes.md's "Isolation: bf16 alone fixes it"
+      and "Fix promoted to production" entries for full detail. Still open, unrelated: the VAE
+      5D-unification assumption in `export/exporters/vae.py` remains unverified against real
+      ComfyUI source.
+- [ ] **New, separate bug found running the first-ever full `generate()`:** with the DiT fix
+      promoted and text_encoder/vae_encoder/vae_decoder built fresh, ran a real I2V generation
+      (81 frames @ 832x480, the real default target, `close_green_chair_start/end.png`,
+      `scripts/run_i2v_generate.py`) — no crash, no NaN (confirms the DiT fix holds up under real
+      end-to-end use, not just isolated trivial-input checks), but the decoded output video is
+      **pure noise, no coherent structure, no resemblance to the input images.** Not yet diagnosed:
+      skimmed `FlowMatchEulerScheduler` (`scheduler/flow_match.py`) and `DiTEngine.denoise_step`'s
+      CFG formula (`engine/dit_engine.py`) and both look structurally correct at a glance (standard
+      shifted-sigma Euler integration, standard `uncond + scale*(cond-uncond)` CFG) — needs a real
+      bisection, not a read-through fix.
+
+      **Update, same session: implemented real Wan 2.2 MoE two-pass expert switching** (`WanEngine`
+      now takes `dit_high_noise`/`dit_low_noise`, switches at 50% of `num_inference_steps` — switch
+      rule confirmed against ComfyUI's own official blueprints, not assumed; see
+      wan2.2_i2v_14b_notes.md) and **built the `low_noise` expert engine** — mechanically confirmed
+      working (log shows the switch firing at the right step, output distribution genuinely
+      changes) but **did not fix the noise problem**. Also **directly tested the VAE round-trip in
+      isolation** (encode a real image, immediately decode it back, no DiT/scheduler involved) —
+      **fully coherent, clearly recognizable** — this rules the VAE out entirely.
+
+      **Both DiT and VAE are now individually cleared; the bug is elsewhere.** Real remaining gap:
+      every DiT correctness check so far (eager-vs-TensorRT, the bf16 isolation, the MoE
+      confirmation) used **`timestep=0`** — never a representative sample, just a convenient
+      input-independent NaN probe. Real generation sweeps `timestep≈1000` down to `0`; nobody has
+      checked eager-vs-TensorRT agreement at a realistic high-noise timestep with real random
+      latents. Also still unconfirmed: text embedding sanity (tokenizer mismatch — `google/umt5-xxl`
+      vs ComfyUI's own SentencePiece tokenizer, flagged in `runpod_setup.md`, never independently
+      checked). **Next session should start with an eager-vs-TensorRT DiT comparison at a realistic
+      high-`timestep` sample**, the largest remaining untested gap. See wan2.2_i2v_14b_notes.md's
+      "MoE switch works mechanically but doesn't fix coherence" entry
 - [ ] Build engines for the default resolution profiles and confirm cache hit/miss behavior —
       also revisit `_build_optimization_profile`: found while doing this that
       `ResolutionProfile.height`/`.width` are never actually read there, so multiple resolution
-      profiles currently just build identical duplicate optimization profiles
+      profiles currently just build identical duplicate optimization profiles. **Real target,
+      clarified 2026-08-07: not a fixed list of named profiles — arbitrary width/height divisible
+      by 16 (Wan's hard requirement), e.g. 32x32, 480x832, 720x1088, 960x1248.** Current shape
+      comes entirely from `DiTExporter`'s hardcoded `latent_frames`/`latent_height`/`latent_width`
+      kwargs (default 21/60/104, i.e. 81 frames @ 480x832) via a single static-or-narrow-dynamic
+      optimization profile — nothing today lets a caller pick a resolution at generation time
+      within one built engine, let alone arbitrary /16 values. Real fix needs the DiT's dynamic
+      axes (`dynamic_axes()`, `export/exporters/dit.py`) actually driven by desired min/max
+      width/height (not just the current opt-only fixed shape), `_build_optimization_profile`
+      wired to read `ResolutionProfile.height`/`.width` instead of ignoring them, and
+      `vae_encoder`/`vae_decoder`'s already-known joint frame/resolution TensorRT build ceiling
+      (see the `vae_encoder` `frames=1` note above) re-examined against whatever range gets chosen
+      — not started
 - [ ] Run `WanEngine.generate()` end to end for T2V; compare output against the FP16 PyTorch
       reference
 - [ ] Same for I2V
@@ -171,19 +342,40 @@ On RTX PRO 6000 Blackwell instances:
       isolated numeric comparison against the PyTorch reference on RunPod before it's trusted in
       a built engine; see plugins.md's validation status section
 - [ ] Per-op FP8 quality gating on Blackwell (PLAN.md: never reduce precision without confirming
-      negligible quality loss)
-- [ ] Real FP8 quantization is not implemented. `export/trt_build.py`'s `_validate_precision`
-      (confirmed against a real TensorRT 11.2 build: `STRONGLY_TYPED` networks have no
-      `BuilderFlag.FP16`/`BF16`/`FP8` at all — precision comes entirely from the ONNX graph's own
-      tensor dtypes) will correctly *reject* an fp8 build attempt today, since nothing in the
-      export pipeline casts to fp8 or inserts calibrated Q/DQ nodes — it just doesn't silently
-      build the wrong thing anymore. Needs a real PTQ/calibration pass (e.g. TensorRT Model
-      Optimizer) inserted before ONNX export before "fp8" as selected by `runtime/precision.py`
+      negligible quality loss) — `runtime/precision.py`'s `select_precision` docstring promises
+      this ("FP8 where a per-op quality check clears it") but the implementation has no such gate:
+      `auto` unconditionally maps Blackwell -> `"fp8"` ceiling. Combined with the loader always
+      casting to fp16 regardless of requested precision, and `_validate_precision`'s real gap
+      below, this silently produced a genuinely-fp16 engine mislabeled "fp8" in the cache — hit
+      for real on 2026-08-06 building `text_encoder` with `--precision auto` on this Blackwell
+      box; see docs/wan2.2_i2v_14b_notes.md's 2026-08-06 session section. **Until this gate is
+      real, always pass `--precision fp16` explicitly — never rely on `auto` on Blackwell.**
+- [ ] `_validate_precision`'s real gap, found via the above: it only checks the ONNX graph's
+      *network input* tensors, not internal weights — so a component whose inputs happen to be
+      all-non-float (text_encoder's `input_ids`/`attention_mask` are both `INT64`) has zero float
+      tensors to check and the validator silently no-ops, regardless of requested precision. Only
+      components with float inputs (dit's `x`/`context`, vae's `pixels`/`latent`) actually get
+      checked, and correctly *reject* an fp8 build attempt there today (confirmed: `STRONGLY_TYPED`
+      networks have no `BuilderFlag.FP16`/`BF16`/`FP8` at all — precision comes entirely from the
+      ONNX graph's own tensor dtypes, and nothing in the export pipeline casts to fp8 or inserts
+      calibrated Q/DQ nodes). Needs a real PTQ/calibration pass (e.g. TensorRT Model Optimizer)
+      inserted before ONNX export before "fp8" as selected by `runtime/precision.py`
       can actually work — see wan2.2_i2v_14b_notes.md
 - [ ] `examples/loaders/wan_comfyui_loader.py`'s `load_dit()` force-casts to `TRTWAN_LOADER_DTYPE`
       (default fp16) — fine for this fp16 checkpoint, but would silently clobber an
       already-quantized (fp8/int4/AWQ) checkpoint's precision. Should detect and preserve the
       checkpoint's native dtype instead of always casting
+- [ ] `EngineCache`'s content-addressed `{digest}.engine`/`.json` filenames (`runtime/cache.py`)
+      make on-disk debugging harder than it needs to be — a rebuild of the same component just
+      lands under a new opaque hash, old ones pile up needing manual cleanup, and there's no way to
+      tell what's what from `ls` alone. User feedback (2026-08-07): prefer human-readable filenames
+      (e.g. `{component}.engine`, overwritten in place on rebuild) over content-addressed ones —
+      easier to debug, and a rebuild just overwrites rather than accumulating stale entries. Not
+      done yet, deliberately deferred (mid-debugging-session, didn't want to spend the time then).
+      Trade-off to think through before implementing: content-addressing is what makes
+      `EngineCache.get()`'s cache-hit/miss check possible without re-running the build — a
+      human-readable scheme needs a different mechanism for that (e.g. a separate lookup index
+      mapping cache-key -> filename) if the cache-hit behavior should be kept.
 
 ## Phase 3 — Feature completeness
 

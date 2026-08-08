@@ -2,6 +2,7 @@ from . import (
     cache_manager,
     conditioning_manager,
     diagnostics,
+    dit_loader,
     engine_builder,
     engine_inspector,
     loader,
@@ -18,6 +19,7 @@ _MODULES = (
     runtime_manager,
     precision_selector,
     loader,
+    dit_loader,  # recommended path for a real ComfyUI workflow -- see dit_loader.py's docstring
     engine_builder,
     text_encoder,
     vae_encoder,

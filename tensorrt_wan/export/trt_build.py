@@ -6,6 +6,7 @@ covers every configured resolution rather than needing one engine per shape.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -49,6 +50,17 @@ def build_tensorrt_engine(
     if workspace_limit_mb is not None:
         config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_limit_mb * (1 << 20))
 
+    # TensorRT's build-time cost is almost entirely the CPU-orchestrated tactic search (timing
+    # candidate kernel implementations per layer on the GPU, then picking the fastest) -- there's
+    # no way to make that GPU-only, but `builder_optimization_level` (0-5) controls how exhaustive
+    # that search is. Defaults to 5 (max quality) explicitly rather than relying on TensorRT's own
+    # implicit default (which is level 3, not the max) -- this project never wants a silently
+    # less-optimized production engine. Override via env var only for fast debug-iteration builds
+    # (a 14B-param model's max-level build takes 15-45 minutes; a low level trades final inference
+    # speed for much faster builds, the right tradeoff while bisecting a bug, never for a real
+    # deployment build).
+    config.builder_optimization_level = int(os.environ.get("TRTWAN_BUILDER_OPT_LEVEL", "5"))
+
     for profile_spec in resolution_profiles:
         config.add_optimization_profile(_build_optimization_profile(builder, exporter, profile_spec))
 
@@ -82,25 +94,34 @@ def _validate_precision(network: "trt.INetworkDefinition", precision: PrecisionM
     `precision="auto"` is never passed here; callers resolve it to a concrete value first (see
     `runtime.precision.select_precision`), so every entry in the map above is checked exactly.
 
-    Only floating-point inputs are checked. Confirmed necessary against a real build: the text
+    Only floating-point tensors are checked. Confirmed necessary against a real build: the text
     encoder's `input_ids`/`attention_mask` are legitimately `INT64` token/mask tensors — Wan never
     casts those to fp16 (nor should it; they're indices and a 0/1 mask, not activations), so
     enforcing `precision` against them isn't "an upstream export bug" the way a wrong-dtype
     *activation* tensor would be, it's just comparing the wrong kind of value. Non-float dtypes
     (int/bool) are skipped entirely rather than being held to a float precision they were never
     meant to have.
+
+    Checks *outputs* too, not just inputs — added after a real, previously-undetected bug
+    (2026-08-07): the text encoder's `text_embeds` output came out `DataType.FLOAT` (fp32) despite
+    every *input* being correctly fp16 and this function only ever having checked inputs. A model
+    implementation detail (an internal op — plausibly a stability-motivated fp32 LayerNorm, the
+    same category of thing `patch_embedding` needed explicit handling for elsewhere) had silently
+    produced an fp32 graph output that nothing caught, corrupting every downstream consumer that
+    assumed uniform fp16. See docs/wan2.2_i2v_14b_notes.md.
     """
     import tensorrt as trt
 
     expected = getattr(trt.DataType, _PRECISION_TO_DTYPE_NAME[precision])
     float_dtypes = {getattr(trt.DataType, name) for name in _PRECISION_TO_DTYPE_NAME.values()}
-    for i in range(network.num_inputs):
-        tensor = network.get_input(i)
+    tensors = [network.get_input(i) for i in range(network.num_inputs)]
+    tensors += [network.get_output(i) for i in range(network.num_outputs)]
+    for tensor in tensors:
         if tensor.dtype not in float_dtypes:
             continue
         if tensor.dtype != expected:
             raise RuntimeError(
-                f"Requested precision={precision!r} ({expected}) but ONNX input {tensor.name!r} "
+                f"Requested precision={precision!r} ({expected}) but ONNX tensor {tensor.name!r} "
                 f"is {tensor.dtype}. STRONGLY_TYPED networks take precision entirely from the "
                 f"ONNX graph's own tensor dtypes; re-export with the model cast to {precision} "
                 f"before torch.export instead of expecting the TensorRT builder to coerce it."

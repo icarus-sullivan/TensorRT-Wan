@@ -33,6 +33,9 @@ class TextEncoderEngine:
     def load(self) -> None:
         self._wrapper.load()
 
+    def unload(self) -> None:
+        self._wrapper.unload()
+
     def encode_text(self, prompt: str) -> torch.Tensor:
         tokens = self.tokenizer(prompt)
         outputs = self._wrapper.infer(tokens)

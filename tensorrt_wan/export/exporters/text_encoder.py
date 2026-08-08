@@ -13,8 +13,10 @@ class TextEncoderExporter(ModelExporter):
 
     name = "text_encoder"
 
-    def __init__(self, model: torch.nn.Module, hidden_dim: int, max_tokens: int = 512) -> None:
-        super().__init__(model)
+    def __init__(
+        self, model: torch.nn.Module, hidden_dim: int, max_tokens: int = 512, static: bool = False
+    ) -> None:
+        super().__init__(model, static=static)
         self.hidden_dim = hidden_dim
         self.max_tokens = max_tokens
 
@@ -32,6 +34,8 @@ class TextEncoderExporter(ModelExporter):
         # export time), so declaring a profile range for a dimension the ONNX graph doesn't
         # actually mark dynamic makes the builder reject the profile outright. See
         # docs/wan2.2_i2v_14b_notes.md.
+        if self.static:
+            return {}
         seq_axis = [DynamicAxis(name="dim1", min=1, opt=self.max_tokens, max=self.max_tokens)]
         return {"input_ids": seq_axis, "attention_mask": seq_axis}
 

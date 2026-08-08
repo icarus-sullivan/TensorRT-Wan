@@ -30,6 +30,10 @@ import sys
 
 import torch
 
+from tensorrt_wan.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
 _DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
 
@@ -57,6 +61,42 @@ def _apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
     x_out = freqs_cis[..., 0] * x_[..., 0]
     x_out.addcmul_(freqs_cis[..., 1], x_[..., 1])
     return x_out.reshape(*x.shape).type_as(x)
+
+
+def _rope_fp32(pos: torch.Tensor, dim: int, theta: int) -> torch.Tensor:
+    """Pure-PyTorch clone of `comfy/ldm/flux/math.py`'s `rope()` — same math, `float32` throughout
+    instead of computing the frequency table (`scale`/`omega`) in `float64` before a final cast
+    back down to `float32`.
+
+    Real bug, confirmed via a real build attempt: `rope()`'s internal `torch.einsum("...n,d->...nd",
+    pos.to(dtype=torch.float32, ...), omega)` combines a `float32` tensor (`pos`) with a `float64`
+    tensor (`omega`, from `scale = torch.linspace(..., dtype=torch.float64, ...)`). Eager PyTorch
+    tolerates this via implicit type promotion (computes in `float64`, the function's own final
+    `.to(dtype=torch.float32, ...)` cast discards the extra precision anyway) — but `torch.export`/
+    ONNX freezes the einsum with two genuinely different input dtypes baked in. `onnxruntime`
+    correctly rejects loading the resulting graph outright (`Type parameter (T) of Optype (Einsum)
+    bound to different types (tensor(float) and tensor(double))`); TensorRT's parser accepted it
+    anyway but the built engine then returned 100% NaN on *every* input, including its own trivial
+    all-zero `example_inputs()` — a completely input-independent failure, consistent with a
+    structural graph-level type bug rather than a numerical-instability one. `EmbedND.forward()`
+    (`comfy/ldm/flux/layers.py`) calls this unconditionally on every DiT forward pass via
+    `self.rope_embedder(img_ids)` (`comfy/ldm/wan/model.py`'s `rope_encode`) — not gated behind
+    `rope_encode`'s `if source_id:` branch, which stays dead at the default `source_id=0` this
+    project always calls with. See docs/wan2.2_i2v_14b_notes.md's 2026-08-06 session.
+
+    Since the float64 intermediate was never actually exposed past this function's own final
+    float32 cast, dropping it doesn't change the *interface* this project relies on — dropping the
+    double-precision computation of `theta**scale` for a `theta=10000`-scale RoPE table is squarely
+    the same precision this repo already accepts everywhere else in an fp16 pipeline, not a new
+    source of error.
+    """
+    assert dim % 2 == 0
+    scale = torch.linspace(0, (dim - 2) / dim, steps=dim // 2, dtype=torch.float32, device=pos.device)
+    omega = 1.0 / (theta**scale)
+    out = torch.einsum("...n,d->...nd", pos.to(dtype=torch.float32, device=pos.device), omega)
+    out = torch.stack([torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1)
+    out = out.reshape(*out.shape[:-1], 2, 2)
+    return out.to(dtype=torch.float32, device=pos.device)
 
 
 def _decomposed_sdpa(
@@ -87,6 +127,13 @@ def _decomposed_sdpa(
     recognize and fuse (see docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/
     transformers-fused-attention.html). See docs/wan2.2_i2v_14b_notes.md's 2026-08-06 session
     section for the full investigation.
+
+    The DiT's self-attention at real target scale (~32,760 tokens) additionally needs the model
+    built with `bf16` precision, not `fp16` -- see `load_dit`'s docstring and
+    docs/wan2.2_i2v_14b_notes.md's 2026-08-07 session. (Also tried query-chunking this function to
+    break TensorRT's fusion pattern-match at that scale, thinking the fusion itself was the
+    problem; isolated and confirmed that wasn't it -- fp16+chunked still NaN'd, bf16 alone without
+    chunking was already clean. Don't re-add chunking here without re-reading that session first.)
     """
     if enable_gqa:
         n_rep = query.shape[-3] // key.shape[-3]
@@ -114,14 +161,27 @@ def _decomposed_sdpa(
 def _decompose_attention_for_export() -> None:
     """Monkeypatch `torch.nn.functional.scaled_dot_product_attention` to `_decomposed_sdpa` for
     the duration of this process. Every attention call path in this loader (`comfy.ops`'s
-    `scaled_dot_product_attention` wrapper, used by both the text encoder and the VAE) bottoms
+    `scaled_dot_product_attention` wrapper, used by the text encoder, the VAE, and the DiT) bottoms
     out in the real `torch.nn.functional.scaled_dot_product_attention` regardless of which
-    internal branch it takes, so patching that one global function covers both — see
+    internal branch it takes, so patching that one global function covers all three — see
     `_decomposed_sdpa`'s docstring for why this is necessary. Only affects this process, not a
     running ComfyUI server (separate process/memory space), same reasoning as the `apply_rope1`
-    monkeypatch in `load_dit`. Not applied in `load_dit` itself: the DiT's own attention already
-    finds a dedicated fused kernel with no such error, so it doesn't need this and re-decomposing
-    it would only cost performance for no correctness benefit.
+    monkeypatch in `load_dit`.
+
+    Now also applied in `load_dit` (previously excluded — see docs/wan2.2_i2v_14b_notes.md's
+    2026-08-07 session for the full story). The original reasoning was real but scale-limited: the
+    DiT's native ONNX `Attention` op *does* find a dedicated TensorRT kernel with no build error —
+    confirmed, that's not wrong — but that observation was made at a tiny smoke-test scale (~768
+    attention tokens). At this project's actual target scale (~32,760 tokens, real resolution/frame
+    count), the built DiT engine returns 100% NaN on every input including its own trivial
+    all-zero example_inputs(), and bisecting per-layer activations against a clean eager comparison
+    localized the divergence to right around the first self-attention block that uses this op. The
+    same class of shape-dependent TensorRT correctness gap was already independently confirmed for
+    `vae_encoder` this session (works at small T, fails at real scale) — "no build error at one
+    scale" was never proof of "numerically correct at every scale." Decomposing costs some
+    inference performance (this fused-kernel path was presumably faster when it worked); worth
+    revisiting once profiling data exists to know whether that cost is worth optimizing back out
+    for a scale where the native op is actually safe.
     """
     torch.nn.functional.scaled_dot_product_attention = _decomposed_sdpa
 
@@ -153,10 +213,20 @@ def load_dit(checkpoint_path: str) -> torch.nn.Module:
     docs/wan2.2_i2v_14b_notes.md's MoE section); call this once per expert and export/build each
     as its own engine.
 
-    Override device/dtype via `TRTWAN_LOADER_DEVICE` (default `cuda`) / `TRTWAN_LOADER_DTYPE`
-    (default `fp16`; one of fp32/fp16/bf16) if you need to debug against a CPU or fp32 trace.
+    Override device via `TRTWAN_LOADER_DEVICE` (default `cuda`) if you need to debug against a CPU
+    trace. Dtype is **not** overridable via `TRTWAN_LOADER_DTYPE` here, unlike every other loader
+    in this file — hardcoded to `bf16` and deliberately ignores that env var (logging a warning if
+    it's set to anything else) rather than silently honoring it. Confirmed via a full session's
+    bisection (docs/wan2.2_i2v_14b_notes.md, 2026-08-07): a `fp16` DiT engine returns 100% NaN on
+    every input at this project's real target scale (~32,760-token self-attention) — not a
+    monkeypatch bug, not a TensorRT fusion-pattern issue (both ruled out), but `fp16`'s dynamic
+    range inside TensorRT's self-attention kernel specifically. `bf16` is not a performance
+    tuning choice for the DiT, it's the difference between a working and a silently-broken engine
+    — an env var flip should not be able to reintroduce that failure mode without at least a loud
+    warning.
     """
     _add_comfyui_to_path()
+    _decompose_attention_for_export()
 
     import comfy.ldm.wan.model as wan_model  # noqa: E402
     import comfy.sd  # noqa: E402
@@ -171,8 +241,26 @@ def load_dit(checkpoint_path: str) -> torch.nn.Module:
     # process, not a running ComfyUI server (separate process/memory space).
     wan_model.apply_rope1 = _apply_rope1
 
+    # See _rope_fp32's docstring: comfy/ldm/flux/layers.py's EmbedND.forward() resolves `rope`
+    # against its own module namespace (`from .math import ... rope`), not wan/model.py's — the
+    # patch must target that binding, not wan_model.rope, to actually intercept the call
+    # rope_encode() makes on every forward pass via self.rope_embedder(img_ids).
+    import comfy.ldm.flux.layers as flux_layers  # noqa: E402
+
+    flux_layers.rope = _rope_fp32
+
     device = os.environ.get("TRTWAN_LOADER_DEVICE", "cuda")
-    dtype = _DTYPES[os.environ.get("TRTWAN_LOADER_DTYPE", "fp16")]
+    requested = os.environ.get("TRTWAN_LOADER_DTYPE")
+    if requested is not None and requested != "bf16":
+        logger.warning(
+            "TRTWAN_LOADER_DTYPE=%r is set but load_dit() ignores it and always uses bf16 -- "
+            "fp16 is a confirmed-broken combination for the DiT at real target scale (100%% NaN, "
+            "see docs/wan2.2_i2v_14b_notes.md's 2026-08-07 session). If you need a non-bf16 DiT "
+            "trace for debugging, cast the returned model directly instead of relying on this env "
+            "var.",
+            requested,
+        )
+    dtype = torch.bfloat16
 
     model_patcher = comfy.sd.load_diffusion_model(checkpoint_path, model_options={})
     diffusion_model = model_patcher.model.diffusion_model
@@ -200,6 +288,19 @@ class _TextEncoderWrapper(torch.nn.Module):
     `example_inputs()`'s `input_ids`/`attention_mask` names get called against; without it,
     `torch.export` would trace `exporter.model.__call__` against a 2-tuple return, mismatching
     `TextEncoderExporter.output_names`'s single `text_embeds`.
+
+    Also explicitly casts that return value to the transformer's own target dtype. Real bug,
+    confirmed via a real generate() attempt (2026-08-07): without this, the built engine's
+    `text_embeds` *output* binding came out `DataType.FLOAT` (fp32) even though the engine was
+    built `--precision fp16` and every *input* passed `_validate_precision`'s check — that
+    function (`export/trt_build.py`) only iterates `network.get_input(i)`, never outputs, so a
+    T5 implementation detail (some internal op, plausibly a final LayerNorm kept fp32 for
+    stability — the same category of thing `patch_embedding` needed explicit handling for on the
+    DiT side) silently produced an fp32 graph output that nothing caught. Downstream, this
+    corrupted every DiT call fed this `context`: `torch.cat([x, mask, image_latent])`-style
+    concatenation silently promotes to the wider dtype rather than erroring, and the built
+    STRONGLY_TYPED DiT engine — whose own `context` input is genuinely fp16 — received fp32 data
+    reinterpreted/miscast at the TensorRT boundary. See docs/wan2.2_i2v_14b_notes.md.
     """
 
     def __init__(self, transformer: torch.nn.Module) -> None:
@@ -207,7 +308,8 @@ class _TextEncoderWrapper(torch.nn.Module):
         self.transformer = transformer
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        return self.transformer(input_ids, attention_mask)[0]
+        dtype = next(self.transformer.parameters()).dtype
+        return self.transformer(input_ids, attention_mask)[0].to(dtype=dtype)
 
 
 def load_text_encoder(checkpoint_path: str) -> torch.nn.Module:
@@ -276,12 +378,16 @@ class _VAEDecodeWrapper(torch.nn.Module):
 
 def _load_wan_vae(checkpoint_path: str) -> torch.nn.Module:
     """Shared by `load_vae_encoder`/`load_vae_decoder` — both directions live in the same
-    checkpoint/module (`comfy.ldm.wan.vae2_2.WanVAE`, confirmed via `comfy.sd.VAE`'s dispatch on
-    the real `wan2.2_vae.safetensors` file on RunPod hardware), so there's one real load here and
-    two thin per-direction wrappers around it, not two separate loads.
+    checkpoint/module (`comfy.ldm.wan.vae2_2.WanVAE`, confirmed via `comfy.sd.VAE`'s dispatch),
+    so there's one real load here and two thin per-direction wrappers around it, not two
+    separate loads.
 
     Caller (`export`/`build` CLI) treats `checkpoint_path` as opaque — for this VAE it must be
-    ComfyUI's own `models/vae/wan2.2_vae.safetensors`, not a diffusion_models/text_encoders path.
+    ComfyUI's own `models/vae/wan_2.1_vae.safetensors` (z_dim=16, matches these 14B DiT
+    checkpoints), **not** `models/vae/wan2.2_vae.safetensors` (z_dim=48 — that file is for Wan
+    2.2's separate 5B TI2V model, a real bug caught and fixed via a real build attempt on RunPod
+    hardware; see docs/wan2.2_i2v_14b_notes.md's 2026-08-06 session section). Also not a
+    diffusion_models/text_encoders path.
     """
     _add_comfyui_to_path()
     _decompose_attention_for_export()

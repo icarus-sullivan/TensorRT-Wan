@@ -79,6 +79,7 @@ def run_engine(args: argparse.Namespace) -> int:
         gpu_architecture=gpu.architecture.value,
         optimization_profile=",".join(p.name for p in profiles),
         precision=precision,
+        input_shape_digest=exporter.shape_digest(),
     )
 
     if not args.force:

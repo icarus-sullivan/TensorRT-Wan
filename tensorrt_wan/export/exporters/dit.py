@@ -32,14 +32,44 @@ class DiTExporter(ModelExporter):
         latent_frames: int = 21,
         latent_height: int = 60,
         latent_width: int = 104,
+        min_latent_height: int = 32,
+        max_latent_height: int = 160,
+        min_latent_width: int = 32,
+        max_latent_width: int = 160,
+        static: bool = False,
     ) -> None:
-        super().__init__(model)
+        super().__init__(model, static=static)
         self.in_channels = in_channels
         self.text_dim = text_dim
         self.max_text_tokens = max_text_tokens
         self.latent_frames = latent_frames
         self.latent_height = latent_height
         self.latent_width = latent_width
+        # Pixel-space [256, 1280] / vae_spatial_scale(8) = latent [32, 160] -- confirmed range
+        # 2026-08-08: covers every resolution named so far (480x832 today's built shape, 720x1088
+        # the real I2V source images, 960x1248 a stated future target), all divisible by 16 per
+        # Wan's hard requirement. `opt` stays at today's known-good 480x832
+        # (latent_height=60/latent_width=104) so that shape keeps its best-tuned tactics; other
+        # shapes within [min, max] still work, just not as optimally tuned as the profile's own
+        # opt point. See docs/wan2.2_i2v_14b_notes.md.
+        self.min_latent_height = min_latent_height
+        self.max_latent_height = max_latent_height
+        self.min_latent_width = min_latent_width
+        self.max_latent_width = max_latent_width
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Always `bf16`, ignoring `TRTWAN_LOADER_DTYPE` -- overrides `ModelExporter.dtype`'s
+        env-var-driven default. Must match `examples/loaders/wan_comfyui_loader.py`'s `load_dit()`,
+        which hardcodes the same thing for the same reason: a `fp16` DiT at this project's real
+        target scale (~32,760-token self-attention) returns 100% NaN on every input, confirmed via
+        a full bisection (docs/wan2.2_i2v_14b_notes.md, 2026-08-07 session) that ruled out every
+        other candidate (attention decomposition, TensorRT's NaN strictness, the modulation/gate
+        path). If this diverges from `load_dit`'s own dtype, `example_inputs()` builds tensors in
+        one dtype against a model loaded in another -- exactly the failure `ModelExporter.dtype`'s
+        base docstring already describes for the untargeted case.
+        """
+        return torch.bfloat16
 
     def example_inputs(self) -> dict[str, torch.Tensor]:
         return {
@@ -62,11 +92,19 @@ class DiTExporter(ModelExporter):
         # min=1,opt=1,max=4 but tensor has 1"). timestep/context end up fully static once their
         # only dynamic candidate (batch) specializes, so they're omitted entirely here rather
         # than given an empty axis list.
+        if self.static:
+            return {}
         return {
             "x": [
                 DynamicAxis(name="dim2", min=1, opt=self.latent_frames, max=self.latent_frames * 2),
-                DynamicAxis(name="dim3", min=32, opt=self.latent_height, max=self.latent_height * 2),
-                DynamicAxis(name="dim4", min=32, opt=self.latent_width, max=self.latent_width * 2),
+                DynamicAxis(
+                    name="dim3", min=self.min_latent_height, opt=self.latent_height,
+                    max=self.max_latent_height,
+                ),
+                DynamicAxis(
+                    name="dim4", min=self.min_latent_width, opt=self.latent_width,
+                    max=self.max_latent_width,
+                ),
             ],
         }
 

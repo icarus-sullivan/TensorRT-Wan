@@ -50,6 +50,7 @@ def run_export_pipeline(
         gpu_architecture=gpu.architecture.value,
         optimization_profile=profile_key,
         precision=precision,
+        input_shape_digest=exporter.shape_digest(),
     )
 
     if not force:
