@@ -23,8 +23,8 @@ a small script (not hand-edited), so a mismatch would be systematic, not a typo.
    registered.
 3. **Put the input images in ComfyUI's own `input/` directory** — `LoadImage` nodes only see
    files there, not arbitrary paths. Default widget values reference
-   `close_green_chair_start.png`/`close_green_chair_end.png` (`runpod_session_2026-08-06/`
-   locally) — copy them in, or repoint the `LoadImage` nodes at your own images.
+   `close_green_chair_start.png`/`close_green_chair_end.png` (this directory) — copy them in, or
+   repoint the `LoadImage` nodes at your own images.
 4. **Update the two `TensorRTDiTLoader` nodes' `engine_path` widgets** if your built engines live
    somewhere other than `/workspace/runpod-slim/trtwan_model/dit_{high,low}_noise.engine`.
 5. **`unet_name`** on each `TensorRTDiTLoader` must be a real checkpoint filename ComfyUI's

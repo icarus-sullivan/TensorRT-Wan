@@ -211,7 +211,7 @@ for meta_path in CACHE_DIR.glob("*.json"):
 standalone API's default tokenizer path, unconfirmed to produce byte-identical tokenization to
 ComfyUI's own, but not a known problem so far.)
 
-Test images (`close_green_chair_start.png`/`_end.png`, in `runpod_session_2026-08-06/` locally)
+Test images (`close_green_chair_start.png`/`_end.png`, in `comfyui/examples/` locally)
 are **RGBA**, not RGB — strip the alpha channel (`image[:3]`) before feeding them to the VAE
 encoder, or you'll get a channel-count shape mismatch.
 

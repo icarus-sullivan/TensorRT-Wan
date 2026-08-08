@@ -37,8 +37,7 @@ produced this coherent result immediately.
   exported DiT graph has no `clip_fea` input at all, and no LoRA was ever applied to our engine).
 - Sampler: real `custom_nodes/spnxx/sampler/two_phase_sampler.py`, `steps=12`,
   `high_cfg=1.8, low_cfg=1.1`, 50/50 step split, `sampler_name="euler"`, `scheduler="sgm_uniform"`.
-- Prompt: `"a green chair"`. Images: `close_green_chair_start.png`/`_end.png`
-  (`runpod_session_2026-08-06/`).
+- Prompt: `"a green chair"`. Images: `close_green_chair_start.png`/`_end.png` (`comfyui/examples/`).
 
 ## Real integration details required to make this work
 
