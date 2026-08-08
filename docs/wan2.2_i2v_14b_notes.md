@@ -2176,3 +2176,68 @@ session; only the standalone API path (what's actually been under test) was fixe
 Decided (user): stripped the chunking code back out, hardened `bf16` against silent regression.
 See the "Fix promoted to production" entry above for what actually landed and the new bug it
 surfaced.
+
+## 2026-08-08 session: Refit-API LoRA support — groundwork findings (not yet implemented)
+
+LoRA currently has **zero effect** on the TensorRT DiT path by design: `TensorRTDiTModule.forward()`
+(`comfyui/nodes/dit_loader.py`) calls the compiled TensorRT engine directly and never reads the
+wrapped model's `nn.Module` parameters. ComfyUI's LoRA nodes patch `ModelPatcher`'s parameter dict
+(`add_patches` → `patch_model()` mutates real weights in place); our engine's weights are baked
+into the `.engine` file at build time, so any LoRA patch silently lands on the dummy
+`patch_embedding` Conv3d (which exists only so `WAN22.concat_cond` can read its weight shape) and
+never touches actual computation. Confirmed empirically (user loaded a real LoRA in the ComfyUI
+workflow, no visible effect) before this was traced to root cause.
+
+**The real fix is TensorRT's Refit API**, confirmed available on this pod's TensorRT 11.2.1.2:
+`trt.BuilderFlag.REFIT` and `trt.Refitter` both exist (`python3 -c "import tensorrt as trt;
+print('REFIT' in dir(trt.BuilderFlag)); print(hasattr(trt, 'Refitter'))"` → `True True`). Current
+`tensorrt_wan/export/trt_build.py` does **not** set the REFIT flag — existing DiT engines
+(including the pinned known-working ones) are not refittable as built; a refit-capable engine
+needs a rebuild with that flag set.
+
+**Real Wan LoRA key formats surveyed** (all from real checkpoints in
+`/workspace/runpod-slim/ComfyUI/models/loras/` on the pod) — two distinct naming conventions in
+the wild, both keyed on the identical base module path:
+
+- `wan-lightx2-high.safetensors`: `diffusion_model.blocks.{i}.{submodule}.lora_down.weight` /
+  `.lora_up.weight`, rank **64**. Also has bias/norm deltas: `.diff_b` (bias delta),
+  `.diff` (norm delta, e.g. `norm_k.diff`/`norm_q.diff`), `.diff_m` (per-block modulation delta,
+  shape `[1, 6, 5120]`) — these apply directly (add to base), not a low-rank product.
+- `wan-svi-2-pro-high.safetensors`: `lora_A.weight`/`lora_B.weight` (down≡A, up≡B, same
+  `delta = scale·(up@down)` math), rank **128**, weight-only (no diff_b/diff/diff_m).
+- `DR34ML4Y_I2V_14B_HIGH_V2.safetensors`: same `lora_A`/`lora_B` convention, rank **32**.
+- `wan-4lex.safetensors`: same `lora_A`/`lora_B` convention, rank **32**.
+
+Example full key set for one block (`wan-lightx2-high`, block 0, `cross_attn` + `ffn`):
+```
+diffusion_model.blocks.0.cross_attn.{k,o,q,v}.diff_b            [5120]
+diffusion_model.blocks.0.cross_attn.{k,o,q,v}.lora_down.weight  [64, 5120]   (q/k/v/o all 5120-dim)
+diffusion_model.blocks.0.cross_attn.{k,o,q,v}.lora_up.weight    [5120, 64]
+diffusion_model.blocks.0.cross_attn.norm_k.diff                 [5120]
+diffusion_model.blocks.0.cross_attn.norm_q.diff                 [5120]
+diffusion_model.blocks.0.diff_m                                 [1, 6, 5120]
+diffusion_model.blocks.0.ffn.0.diff_b                            [13824]
+diffusion_model.blocks.0.ffn.0.lora_down.weight                  [64, 5120]
+diffusion_model.blocks.0.ffn.0.lora_up.weight                    [13824, 64]
+diffusion_model.blocks.0.ffn.2.diff_b                            [5120]
+diffusion_model.blocks.0.ffn.2.lora_down.weight                  [64, 13824]
+diffusion_model.blocks.0.ffn.2.lora_up.weight                    [5120, 64]
+```
+(`ffn.0` = up-projection 5120→13824, `ffn.2` = down-projection 13824→5120 — matches Wan's DiT FFN
+dims. `cross_attn.{q,k,v,o}` all operate at the 5120 model dim.) 1500 total keys for
+`wan-lightx2-high` (rank-64 + diffs), 800 total keys for the three rank-32/128 `lora_A/B`-only
+files (no diffs).
+
+**Still open / next step:** whether our exported DiT ONNX's initializer names match this
+`diffusion_model.blocks.{i}.{submodule}.weight` convention (minus the `diffusion_model.` prefix,
+presumably, since our export traces the bare `WanModel`, not a full checkpoint) — this determines
+whether refit is a straight name-based lookup or needs an explicit mapping table between ONNX
+initializer names and LoRA checkpoint key names. Export in progress at time of writing
+(`dit_high_noise.onnx`, `--exporter-kwargs '{"in_channels": 36, "text_dim": 4096}'`); check this
+doc's next entry or `git log` for the result before assuming either way.
+
+**Design input from user (mid-investigation):** the LoRA UX should work like a normal ComfyUI
+multi-LoRA loader node (model in, model out) if at all possible, OR a custom TensorRT-specific
+LoRA picker node that performs the refit per selected LoRA — not a requirement to select LoRAs
+only at `trtwan build engine` time (which is what Phase 3's roadmap bullet originally assumed
+before Refit was investigated).

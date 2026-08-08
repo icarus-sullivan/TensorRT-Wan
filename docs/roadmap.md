@@ -1,5 +1,19 @@
 # Roadmap
 
+**Strategic direction, 2026-08-08:** the standalone `WanEngine.generate()` path (this project's own
+VAE encoder/decoder + text encoder TensorRT engines, orchestrated end to end) is **deprioritized,
+not actively maintained**. It still builds successfully but the full pipeline produces noise, not
+coherent video, and a full session of bisection (mask polarity, latent normalization, CFG
+embedding, whole-video VAE encoding, scheduler shift) never found the remaining bug. Real ComfyUI +
+this project's TensorRT DiT (`comfyui/nodes/dit_loader.py`'s `TensorRTDiTLoader`, real ComfyUI
+CLIP/VAE/scheduler around it) produced a fully coherent result instead — see
+`docs/known_working/README.md`. The DiT is the actual perf-critical piece (~14B params, 50-100
+forward passes per generation); VAE/text-encoder are comparatively cheap and a much larger source
+of subtle correctness bugs relative to their speedup. VAE/text-encoder exporter+engine source code
+is left in place (dormant, not deleted — see wan2.2_i2v_14b_notes.md's 2026-08-08 cleanup entry)
+in case this direction changes, but new work should assume DiT-only TensorRT + real ComfyUI for
+everything else.
+
 ## Phase 1 — Structure (this repository, current state)
 
 Everything PLAN.md's development rule permits without a GPU: module structure, interfaces,
@@ -381,14 +395,24 @@ On RTX PRO 6000 Blackwell instances:
 
 - [ ] ControlNet / IP-Adapter / LoRA conditioning sources exercised end to end (interfaces exist
       in `conditioning/sources/`, untested against real adapters)
-- [ ] No "TensorRT LoRA Loader" ComfyUI node exists at all (`comfyui/nodes/` has the 13 nodes from
-      PLAN.md's suggested list, none of which is a LoRA node — `TensorRTConditioningManager`'s
-      `lora` socket has nothing to feed it). Also not just a missing node: semantics genuinely
-      differ from a normal ComfyUI `LoraLoader → sampler` flow, since a TensorRT engine's weights
-      are baked in at build time — there's no live weight-patching at inference the way eager
-      PyTorch allows. A real LoRA workflow needs LoRA selection *before* `trtwan build engine`,
-      not as a graph node in the generation workflow. `conditioning/sources/lora.py`/
-      `engine/dit_engine.py` already assume this; nothing surfaces it as a usable ComfyUI flow yet
+- [ ] **LoRA support via TensorRT Refit API — in progress, 2026-08-08.** Confirmed root cause:
+      `TensorRTDiTModule.forward()` (`comfyui/nodes/dit_loader.py`) never reads the wrapped
+      model's parameters, so a normal ComfyUI `LoraLoader`'s weight patches silently land on
+      nothing (they patch `ModelPatcher`'s param dict; our engine's weights are baked into the
+      `.engine` file at build time). Superseded the earlier assumption on this line (LoRA
+      selection only possible *before* `trtwan build engine`) — TensorRT's Refit API
+      (`trt.BuilderFlag.REFIT` + `trt.Refitter`, confirmed available on this pod's TensorRT
+      11.2.1.2) allows swapping weights into an already-built engine, so a real per-generation
+      LoRA workflow is possible. Needs: (1) `trt_build.py` to set the REFIT flag on DiT builds
+      (existing engines, including the pinned known-working ones, are not refittable as built),
+      (2) a name-based mapping between ONNX initializer names and real Wan LoRA checkpoint keys
+      (two conventions surveyed — `lora_down/lora_up` and `lora_A/lora_B`, both keyed on
+      `diffusion_model.blocks.{i}.{submodule}` — see wan2.2_i2v_14b_notes.md's 2026-08-08 Refit
+      session for exact key names/shapes/ranks), (3) a merge step (`delta = scale·(up@down)` plus
+      direct bias/norm `.diff*` deltas) run before each `Refitter.refit_cuda_engine()` call. User
+      wants the resulting UX to look like a normal ComfyUI multi-LoRA loader (model in, model
+      out) if possible, or a custom TensorRT-specific LoRA-picker node that performs the refit —
+      not a build-time-only selection.
 - [ ] `examples/comfyui_workflow_i2v.json`'s `EmptyLatentImage` placeholder has no frame-count
       control at all (it's a 4D image-latent node, not video — no length/frames widget exists on
       it). The Note node in that workflow already flags this; needs an actual 5D
