@@ -2241,3 +2241,129 @@ multi-LoRA loader node (model in, model out) if at all possible, OR a custom Ten
 LoRA picker node that performs the refit per selected LoRA — not a requirement to select LoRAs
 only at `trtwan build engine` time (which is what Phase 3's roadmap bullet originally assumed
 before Refit was investigated).
+
+**Resolved (same day, later session): name-based lookup does NOT work — need a graph-traversal
+mapping table.** Inspected `dit_high_noise.onnx`'s 1216 initializers (`load_external_data=False`,
+no need to touch the 26GB of weight data). Only biases and norm weights kept clean
+`blocks.{i}.{submodule}.{bias,weight}` paths. The actual `q/k/v/o`/`ffn.0`/`ffn.2` **weight**
+matrices — the ones LoRA patches — lost their parameter names entirely: torch.export's
+decomposition transposes `nn.Linear.weight` before it feeds `MatMul`, which bakes it into a new
+constant with a synthetic `val_NNNN` name instead of preserving the original path. Confirmed by
+shape: 321 `val_*` initializers are `[5120,5120]` (40 blocks × 8 attn projections, +1), 40 are
+`[5120,13824]` (`ffn.0`), 40 are `[13824,5120]` (`ffn.2`) — exact expected counts.
+
+The recovery is a clean one-hop graph walk, not a heuristic: every bias-add node's sibling input is
+the `MatMul` whose weight input is the corresponding `val_NNNN` initializer. Verified across
+submodule types and block indices (0, 5, 39):
+
+```
+blocks.0.self_attn.q.bias  -> val_570  [5120, 5120]
+blocks.0.self_attn.k.bias  -> val_592  [5120, 5120]
+blocks.0.cross_attn.o.bias -> val_689  [5120, 5120]
+blocks.0.ffn.0.bias        -> val_696  [5120, 13824]   (note: [in,out], transposed vs PyTorch's [out,in])
+blocks.0.ffn.2.bias        -> val_698  [13824, 5120]
+blocks.5.self_attn.q.bias  -> val_1357 [5120, 5120]
+blocks.39.ffn.0.bias       -> val_6819 [5120, 13824]
+blocks.39.cross_attn.o.bias-> val_6812 [5120, 5120]
+```
+
+Algorithm: for each known bias name, find the single `Add` node consuming it, take its other input
+(a `MatMul` output), and that `MatMul` node's initializer-typed input is the weight. This is
+deterministic and cheap (graph-only, no weight data needed) — compute once per exported ONNX and
+cache the `(block_idx, submodule) -> onnx_weight_initializer_name` table as a JSON sidecar.
+
+**Still open:** whether TensorRT's `Refitter.set_named_weights()` addresses weights by this same
+ONNX initializer name, or by a layer name TRT assigns during optimization/fusion (which may differ
+if the builder fuses the transpose into the MatMul, or fuses MatMul+Add into one node) — need a
+REFIT-flagged engine build to check `trt.Refitter.get_all_weights()`'s actual names against this
+table before assuming they match 1:1. Existing pinned engines are not refit-capable as built
+(REFIT flag not set in `trt_build.py`); this needs its own engine rebuild to test, separate from
+tonight's known-working rebuild.
+
+## 2026-08-09 (cont.): Refit-API validated end-to-end (structurally) — plus two build-speed findings
+
+**Resolved: `REFIT_INDIVIDUAL` is the right flag, not plain `REFIT`.** Checked NVIDIA's actual
+docs (not memory) before committing to an approach: plain `REFIT` marks *every* weight refittable
+and is documented to break more fusions than necessary for no benefit here (LoRA only ever touches
+attention/FFN weights, never biases/norms). `REFIT_INDIVIDUAL` + `network.mark_weights_refittable(name)`
+per-weight is strictly better — and per NVIDIA's docs, the ONNX parser already propagates ONNX
+initializer names into TensorRT's weight identifiers by default, so no separate name-mapping layer
+is needed at all. Also confirmed `REFIT_IDENTICAL` is a different, incompatible flag (assumes refit
+values equal build-time values — undefined behavior otherwise) that must never be used for real
+LoRA deltas. `ENABLE_TACTIC_HEURISTIC` was considered and dropped — doesn't exist in TRT 11.2
+(`'ENABLE_TACTIC_HEURISTIC' in dir(trt.BuilderFlag)` → `False`; removed after TRT 8.x).
+
+Implemented in `tensorrt_wan/export/trt_build.py`: `_lora_refittable_weight_names(onnx_path)`
+generalizes the bias→Add→MatMul graph walk across every block (self-terminates when a block index
+matches nothing, so it doesn't assume 40 blocks), found exactly 400 names (40 blocks × 10
+submodules: self_attn/cross_attn {q,k,v,o} + ffn.{0,2}), zero duplicates. `TRTWAN_ENABLE_REFIT=1`
+now sets `REFIT_INDIVIDUAL` and marks exactly those 400 weights via `mark_weights_refittable()`.
+
+**Validated on a real REFIT-flagged build of `dit_high_noise`** (isolated cache dir
+`trtwan_engines_refit_test/`, never touches the pinned known-working engines — `CacheKey.digest()`
+doesn't include the REFIT flag or opt level, so building into the *same* cache dir would have
+silently overwritten the production pin under the identical digest; confirmed this risk before
+running anything): all 400 `mark_weights_refittable()` calls succeeded, and after building,
+`trt.Refitter(engine, logger).get_all_weights()` returned **exactly those same 400 names — perfect
+match, zero discrepancies either direction**. This closes out the "still open" question above:
+the whole pipeline (recover names from ONNX → mark refittable → build → Refitter sees exactly
+those names) works structurally end-to-end. Not yet validated: actually computing a LoRA's delta
+and calling `refitter.set_named_weights()` + `refit_cuda_engine()` to confirm the *applied* engine
+produces visibly different output — that's the next step, wiring into `comfyui/nodes/dit_loader.py`
+(currently a no-op for LoRA, see the entry above) so it can be tested with a real LoRA loaded in a
+ComfyUI workflow.
+
+**Build-speed finding #1 (real, applied): skip the `bytes(serialized)` copy.** Added
+`time.monotonic()` phase instrumentation to `trt_build.py` per a debugging suggestion. Initially
+misread a ~22min gap in the `high_noise` build's log timestamps (between the timing-cache-write log
+and `EngineCache.put`'s "Cached engine at" log) as proof `bytes(serialized)` was the cost —
+reasonable at the time since no direct measurement existed yet, but **wrong**: once instrumented
+directly, the `low_noise` build's `bytes(serialized)` conversion measured **26.7s**, not 22 minutes.
+The original 22min gap was much more likely ordinary GPU/CPU contention from a concurrent ComfyUI
+workflow test running in that same window — the same contention pattern seen repeatedly all
+session whenever ComfyUI ran alongside a build. Correcting the record here rather than leaving the
+wrong claim standing. The fix itself is still valid and kept: `IHostMemory` implements the buffer
+protocol (confirmed via introspection: `nbytes`, `__buffer__`), and `pathlib.Path.write_bytes()`
+already wraps its argument in `memoryview()` internally (confirmed by reading its source) — so
+`build_tensorrt_engine()` now returns the raw `IHostMemory` instead of copying it into a `bytes`
+object first. Verified byte-identical via a real dummy-engine round-trip (sha256 match) before
+applying it to the real path. Real, positive, just a ~27s win on a 28GB engine, not the ~22min one
+originally claimed.
+
+**Build-speed finding #2 (real, unresolved): the actual disk write to `/workspace` can be very
+slow under contention.** Measured `/workspace` (MooseFS network mount) at **689MB/s** via `dd`
+when nothing else was running — 28.6GB would take ~41s at that rate. But mid-`low_noise`-build,
+with ComfyUI running again (user had restarted it to test something), the actual engine write was
+observed crawling at **~17MB/s** (12.84GB written over ~12.5 minutes before the build was killed) —
+40x slower than the clean measurement, and CPU-bound-looking (~97%, one core) rather than
+I/O-wait-looking, which doesn't obviously fit a pure network-throughput explanation and wasn't
+root-caused before the build was stopped. Timing cache and ONNX export both completed fast and
+clean earlier in the same session, so this looks specific to the final large write under
+concurrent load, not a general MooseFS problem. Worth instrumenting the write step itself
+(not just bytes-conversion) next time this comes up, rather than assuming either "network storage"
+or "CPU contention" without measuring.
+
+**Build-speed finding #3 (real, unresolved): the timing cache did NOT meaningfully speed up an
+identical rebuild.** Rebuilt `dit_low_noise` from scratch after the killed attempt (same ONNX, same
+shapes, same REFIT flags, same opt level, timing cache fully populated from both the `high_noise`
+build and the killed `low_noise` attempt's own completed tactic search) expecting a near-total
+cache hit. Actual result: tactic search took **1257.1s**, versus the killed attempt's **1267.5s** --
+a ~10s difference, not the dramatic cut expected from a supposedly-hot cache. Plausible explanation
+(not confirmed): a timing cache only persists the *measured timing* of each candidate tactic, not
+the cost of compiling/instantiating those candidates in the first place -- if kernel
+JIT/instantiation dominates over the timing-measurement step itself, caching timings wouldn't help
+much. Also plausible: `REFIT_INDIVIDUAL` disabling fusion across the 400 marked weights means more,
+smaller, individually-instantiated layers than a non-refit build, and that per-layer instantiation
+cost may simply not be cache-eligible the way tactic timing is. Neither explanation confirmed --
+flagging as open rather than asserting either one.
+
+**End-to-end validation: both experts pass.** `dit_low_noise` REFIT build (`7d16ae577fe5bc92.engine`,
+matches the known-working digest) also validated clean: `Refitter.get_all_weights()` on the
+deserialized engine returned exactly the same 400 names `_lora_refittable_weight_names()` predicted
+from its ONNX -- zero discrepancies, same as `dit_high_noise`. Both pinned-digest DiT experts now
+have confirmed REFIT-capable counterparts in the isolated `trtwan_engines_refit_test/` cache dir
+(never touched the production pin). Next step: wire actual LoRA delta computation +
+`refitter.set_named_weights()` + `refit_cuda_engine()` into `comfyui/nodes/dit_loader.py` (currently
+a no-op for LoRA) and confirm a real LoRA visibly changes output in an actual ComfyUI workflow --
+structural validation (names match) is necessary but not sufficient; the applied numerical effect
+is still unverified.

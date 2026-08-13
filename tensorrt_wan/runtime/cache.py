@@ -72,7 +72,13 @@ class EngineCache:
         return engine_path
 
     def put(self, key: CacheKey, engine_bytes: bytes) -> Path:
-        """Write engine bytes + metadata for `key`, creating the cache directory if needed."""
+        """Write engine bytes + metadata for `key`, creating the cache directory if needed.
+
+        `engine_bytes` is typed loosely (any buffer-protocol object works, e.g. TensorRT's
+        `IHostMemory` -- `write_bytes()` wraps it in `memoryview()` internally) rather than
+        forcing an actual `bytes` instance, so callers can pass TensorRT's serialized engine
+        straight through without copying a multi-GB buffer just to satisfy this type hint.
+        """
         self.directory.mkdir(parents=True, exist_ok=True)
         engine_path, meta_path = self._paths(key)
         engine_path.write_bytes(engine_bytes)

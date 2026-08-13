@@ -23,6 +23,8 @@ workflow.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 from safetensors import safe_open
 
@@ -32,6 +34,22 @@ import comfy.sd
 import folder_paths
 
 from tensorrt_wan.engine.base import TensorRTEngineWrapper
+
+# Registers a real ComfyUI model-folder dropdown for engine_name (like unet_name/lora_name
+# already get) instead of a free-text path field. `ComfyUI/models/tensorrt_engines/` is a plain
+# directory of symlinks (aliases) into wherever the actual multi-GB engine files live
+# (trtwan_known_working_engines/, trtwan_engines_refit_test/, etc.) -- nothing gets copied, this
+# is just ComfyUI's standard single-directory-per-model-type convention pointed at whatever we've
+# chosen to alias in there. Registered at import time (module-level, runs once when ComfyUI loads
+# this custom node package), matching how ComfyUI custom nodes conventionally add new model types
+# (see folder_paths.folder_names_and_paths). Sidecar .lora_map.json files are aliased in
+# alongside their .engine with a matching basename -- TensorRTDiTLoraLoader derives the sidecar
+# path from the chosen engine's path, so nothing extra to register for those.
+_TENSORRT_ENGINE_DIR = "/workspace/runpod-slim/ComfyUI/models/tensorrt_engines"
+if "tensorrt_engines" not in folder_paths.folder_names_and_paths:
+    folder_paths.folder_names_and_paths["tensorrt_engines"] = ([], {".engine"})
+Path(_TENSORRT_ENGINE_DIR).mkdir(parents=True, exist_ok=True)
+folder_paths.add_model_folder_path("tensorrt_engines", _TENSORRT_ENGINE_DIR)
 
 _SAFETENSORS_DTYPES = {
     "F16": torch.float16, "F32": torch.float32, "BF16": torch.bfloat16,
@@ -90,10 +108,22 @@ class TensorRTDiTModule(torch.nn.Module):
     has no way to introspect the engine's own bound shapes for these, they're fixed at export time.
     """
 
-    def __init__(self, engine_path: str, in_channels: int = 36, max_text_tokens: int = 512) -> None:
+    def __init__(
+        self,
+        engine_path: str,
+        in_channels: int = 36,
+        max_text_tokens: int = 512,
+        checkpoint_path: str | None = None,
+    ) -> None:
         super().__init__()
         self.dtype = torch.bfloat16
         self.max_text_tokens = max_text_tokens
+        # checkpoint_path (the *original*, non-TensorRT checkpoint) is only needed by
+        # TensorRTDiTLoraLoader (lora_loader.py) -- it has no real base weights to read back a
+        # LoRA delta against otherwise (TensorRT's Refitter can't read a never-yet-refit weight,
+        # see docs/wan2.2_i2v_14b_notes.md). Stored here rather than requiring the LoRA node to
+        # take it as a separate manual input -- TensorRTDiTLoader already knows this path.
+        self.checkpoint_path = checkpoint_path
         # WAN22.concat_cond (comfy/model_base.py) introspects
         # `diffusion_model.patch_embedding.weight.shape[1]` to compute how many extra
         # conditioning channels it needs -- only `.weight.shape[1]` is ever read, no real conv
@@ -101,6 +131,12 @@ class TensorRTDiTModule(torch.nn.Module):
         self.patch_embedding = torch.nn.Conv3d(in_channels, 1, kernel_size=1)
         self._wrapper = TensorRTEngineWrapper(engine_path, device=comfy.model_management.get_torch_device())
         self._wrapper.load()
+
+    @property
+    def wrapper(self) -> TensorRTEngineWrapper:
+        """Exposed for `TensorRTDiTLoraLoader` (comfyui/nodes/lora_loader.py) to call
+        `.refit_weights()` on -- nothing in `forward()` needs this, only LoRA application."""
+        return self._wrapper
 
     def forward(self, x, timestep, context=None, control=None, transformer_options=None, **extra_conds):
         # Our exported DiT's `context` input has no dynamic axis (max_text_tokens baked in at
@@ -143,8 +179,9 @@ class TensorRTDiTLoader:
     `UNETLoader`/`Power Lora Loader` chain, no other node in this package required.
 
     `unet_name` is the *original* (non-TensorRT) checkpoint -- only used to derive the correct
-    shell config, never actually run. `engine_path` is this project's own built TensorRT `.engine`
-    file (see docs/runpod_setup.md for how to build one).
+    shell config, never actually run. `engine_name` picks one of this project's own built
+    TensorRT `.engine` files, listed from `_TENSORRT_ENGINE_DIRS` above (see docs/runpod_setup.md
+    for how to build one) -- a real dropdown, not a path you have to type/paste.
     """
 
     CATEGORY = "TensorRT-Wan"
@@ -157,7 +194,7 @@ class TensorRTDiTLoader:
         return {
             "required": {
                 "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "engine_path": ("STRING", {"default": ""}),
+                "engine_name": (folder_paths.get_filename_list("tensorrt_engines"),),
                 "in_channels": ("INT", {"default": 36, "min": 1, "max": 256}),
                 "max_text_tokens": ("INT", {"default": 512, "min": 1, "max": 8192}),
                 "fast_shell_load": ("BOOLEAN", {"default": True}),
@@ -167,18 +204,19 @@ class TensorRTDiTLoader:
     def load(
         self,
         unet_name: str,
-        engine_path: str,
+        engine_name: str,
         in_channels: int,
         max_text_tokens: int,
         fast_shell_load: bool = True,
     ):
+        engine_path = folder_paths.get_full_path_or_raise("tensorrt_engines", engine_name)
         unet_path = folder_paths.get_full_path_or_raise("diffusion_models", unet_name)
         if fast_shell_load:
             model = _load_shell_fast(unet_path)
         else:
             model = comfy.sd.load_diffusion_model(unet_path, model_options={})
         model.model.diffusion_model = TensorRTDiTModule(
-            engine_path, in_channels=in_channels, max_text_tokens=max_text_tokens
+            engine_path, in_channels=in_channels, max_text_tokens=max_text_tokens, checkpoint_path=unet_path
         )
         return (model,)
 

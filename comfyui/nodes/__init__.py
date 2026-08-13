@@ -6,6 +6,7 @@ from . import (
     engine_builder,
     engine_inspector,
     loader,
+    lora_loader,
     precision_selector,
     runtime_manager,
     sampler,
@@ -20,6 +21,7 @@ _MODULES = (
     precision_selector,
     loader,
     dit_loader,  # recommended path for a real ComfyUI workflow -- see dit_loader.py's docstring
+    lora_loader,  # LoRA application for TensorRTDiTLoader models -- see lora_loader.py's docstring
     engine_builder,
     text_encoder,
     vae_encoder,

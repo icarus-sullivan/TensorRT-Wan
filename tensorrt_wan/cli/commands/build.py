@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 
 from tensorrt_wan.cli.loader import resolve_loader
@@ -10,6 +11,7 @@ from tensorrt_wan.cli.runtime_helpers import build_runtime
 from tensorrt_wan.config.schema import DEFAULT_RESOLUTION_PROFILES, ResolutionProfile
 from tensorrt_wan.export.exporters import DiTExporter, TextEncoderExporter, VAEDecoderExporter, VAEEncoderExporter
 from tensorrt_wan.export.trt_build import build_tensorrt_engine
+from tensorrt_wan.lora import onnx_weight_name_map, save_weight_name_map, weight_map_path_for_engine
 from tensorrt_wan.runtime.cache import CacheKey
 from tensorrt_wan.runtime.manager import RuntimeManager
 
@@ -89,10 +91,25 @@ def run_engine(args: argparse.Namespace) -> int:
             return 0
 
     engine_bytes = build_tensorrt_engine(
-        args.onnx, exporter, profiles, precision, workspace_limit_mb=runtime.config.memory.workspace_limit_mb
+        args.onnx,
+        exporter,
+        profiles,
+        precision,
+        workspace_limit_mb=runtime.config.memory.workspace_limit_mb,
+        timing_cache_path=runtime.cache.directory / "trt_timing_cache.bin",
     )
     engine_path = runtime.cache.put(cache_key, engine_bytes)
     print(f"Built {args.component} engine -> {engine_path}")
+
+    # Sidecar survives the onnx file's routine post-build deletion (see
+    # docs/wan2.2_i2v_14b_notes.md) -- comfyui/nodes/lora_loader.py needs this mapping at inference
+    # time and must not depend on the onnx file still existing.
+    if os.environ.get("TRTWAN_ENABLE_REFIT", "0") == "1":
+        weight_map = onnx_weight_name_map(args.onnx)
+        map_path = weight_map_path_for_engine(engine_path)
+        save_weight_name_map(weight_map, map_path)
+        print(f"Wrote LoRA weight-name map -> {map_path}")
+
     return 0
 
 

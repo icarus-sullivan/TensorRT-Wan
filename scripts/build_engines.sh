@@ -19,7 +19,7 @@ CKPT_DIR="${CKPT_DIR:-/workspace/runpod-slim/ComfyUI/models}"
 MODEL_DIR="${MODEL_DIR:-/workspace/runpod-slim/trtwan_model}"
 HEIGHT="${HEIGHT:-480}"
 WIDTH="${WIDTH:-832}"
-RES="${WIDTH}x${HEIGHT}"
+RES="${HEIGHT}x${WIDTH}"
 TARGET="${1:-all}"
 
 cd "$(dirname "$0")/.."
