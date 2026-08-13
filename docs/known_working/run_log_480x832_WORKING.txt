@@ -1,24 +1,0 @@
-WARNING:root:WARNING: You need pytorch with cu130 or higher to use optimized CUDA operations.
-2026-08-08 08:14:36 [INFO] tensorrt_wan.engine.base: Loading TensorRT engine from /workspace/runpod-slim/trtwan_model/dit_high_noise.engine
-[08/08/2026-08:15:00] [TRT] [W] WARNING The logger passed into createInferRuntime differs from one already registered for an existing builder, runtime, or refitter. So the current new logger is ignored, and TensorRT will use the existing one which is returned by nvinfer1::getLogger() instead.
-2026-08-08 08:15:00 [INFO] tensorrt_wan.engine.base: Loading TensorRT engine from /workspace/runpod-slim/trtwan_model/dit_low_noise.engine
-WARNING:root:Warning: Ran out of memory when regular VAE encoding, retrying with tiled VAE encoding.
-Loading real CLIP (umt5_xxl)...
-Loading real VAE (wan_2.1_vae)...
-Loading real model shells (for correct model_sampling/latent_format/concat_keys config)...
-Swapping in our TensorRT DiT engines...
-Encoding text (real CLIP)...
-Building conditioning (real WanFMLFPluggable, no LoRA/clip_vision)...
-Running real two_phase_sampler (steps=12, high_cfg=1.8, low_cfg=1.1, euler/sgm_uniform)...
-Spnxx - Starting 1st Phase ...
-[SPNXX latent] get_previewer — format=Wan21 previewer=NoneType
-[SPNXX latent] failed to read extra: 'NoneType' object has no attribute 'currently_running'
-  0%|          | 0/6 [00:00<?, ?it/s] 17%|█▋        | 1/6 [00:09<00:49,  9.99s/it] 33%|███▎      | 2/6 [00:20<00:40, 10.03s/it] 50%|█████     | 3/6 [00:30<00:30, 10.07s/it] 67%|██████▋   | 4/6 [00:40<00:20, 10.10s/it] 83%|████████▎ | 5/6 [00:50<00:10, 10.12s/it]100%|██████████| 6/6 [01:00<00:00, 10.14s/it]100%|██████████| 6/6 [01:00<00:00, 10.11s/it]
-Spnxx - Starting 2nd Phase ...
-[SPNXX latent] get_previewer — format=Wan21 previewer=NoneType
-[SPNXX latent] failed to read extra: 'NoneType' object has no attribute 'currently_running'
-  0%|          | 0/6 [00:00<?, ?it/s] 17%|█▋        | 1/6 [00:10<00:50, 10.16s/it] 33%|███▎      | 2/6 [00:20<00:40, 10.16s/it] 50%|█████     | 3/6 [00:30<00:30, 10.16s/it] 67%|██████▋   | 4/6 [00:40<00:20, 10.16s/it] 83%|████████▎ | 5/6 [00:50<00:10, 10.16s/it]100%|██████████| 6/6 [01:00<00:00, 10.16s/it]100%|██████████| 6/6 [01:00<00:00, 10.16s/it]
-WARNING:root:Warning: Ran out of memory when regular VAE decoding, retrying with tiled VAE decoding.
-Decoding (real VAE)...
-frames: shape=(81, 480, 832, 3) mean=92.15 per-frame std: [60.12, 59.94, 59.44, 59.36, 59.05, 58.43, 58.23, 60.17, 64.76]
-saved: /workspace/runpod-slim/trtwan_model_inputs/output_real_pipeline.mp4

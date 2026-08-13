@@ -1,95 +1,72 @@
-# TensorRT-Wan
+# TensorRT-RT
 
-TensorRT-Wan is an open-source acceleration framework for [Wan](https://github.com/Wan-Video) video
-generation models. It optimizes the shared Wan DiT backbone with TensorRT — once, not per-workflow —
-so every workflow built on Wan (text-to-video, image-to-video, video-to-video, ControlNet, IP-Adapter,
-LoRA, and future conditioning methods) benefits from the same accelerated runtime.
+Two self-contained, drag-and-droppable ComfyUI custom nodes:
 
-> **Status:** pre-alpha, structure/scaffolding phase. See [PLAN.md](PLAN.md) for the full spec.
-> No engines are built and no inference runs yet — see [Development Status](#development-status).
+- **`comfyui-wanrt/nodes/vae_rt.py`** — TensorRT-accelerated Wan VAE encode/decode.
+- **`comfyui-wanrt/nodes/rife_rt.py`** — TensorRT-accelerated RIFE frame interpolation, modeled on
+  [ComfyUI-Rife-Tensorrt](https://github.com/yuvraj108c/ComfyUI-Rife-Tensorrt).
 
-## Why one engine, not many
+Each file has **no dependency on anything else in this repo** — only `torch`, `tensorrt`,
+`requests`, and ComfyUI's own `comfy`/`folder_paths` modules, all already present in a normal
+ComfyUI install. Copy either file on its own into any `custom_nodes/*/` package's node list, or
+copy this whole `comfyui-wanrt/` directory into `ComfyUI/custom_nodes/` to get both.
 
-Most TensorRT integrations for diffusion models build a separate engine per workflow. TensorRT-Wan
-instead optimizes the single Wan DiT backbone and routes every workflow's conditioning through one
-[`ConditioningManager`](tensorrt_wan/conditioning) into one [`DiTEngine`](tensorrt_wan/engine/dit_engine.py).
-Adding a new conditioning source (a new ControlNet variant, a new adapter) means adding a
-`ConditioningSource`, not a new TensorRT engine.
+## What "just works" without setup
 
-```
-Prompt → Text Encoder ─┐
-Image ──────────────────┼─▶ Conditioning Manager ─▶ Unified TensorRT DiT Engine ─▶ TensorRT VAE Decoder ─▶ Video
-Control/IP-Adapter/LoRA ┘
-```
+Both nodes auto-download their base model and auto-build/cache their TensorRT engine the first
+time they're used — no separate export/build step, no CLI:
 
-See [docs/architecture.md](docs/architecture.md) for the full design.
+- **VAE**: checks `ComfyUI/models/vae/<file>` for the checkpoint; downloads it from HuggingFace
+  if missing. Default is `wan_2.1_vae.safetensors` (correct for Wan 2.1 *and* Wan 2.2's 14B I2V
+  models); `wan2.2_vae.safetensors` is offered as an explicit second option for Wan 2.2's separate
+  5B TI2V model — these are different VAE architectures, never auto-selected by guessing from a
+  DiT checkpoint name.
+- **RIFE**: checks `ComfyUI/models/onnx/rife/` for the pretrained ONNX model; downloads it from
+  `yuvraj108c/rife-onnx` on HuggingFace if missing.
+- Both then build a TensorRT engine from that checkpoint/ONNX the first time it's requested,
+  caching it under `ComfyUI/models/tensorrt/{vae,rife}/` and reusing it on every later run.
 
-## Installation
+## Arbitrary size, with one real caveat
+
+Each engine covers a *wide range of resolutions* via a TensorRT dynamic-shape profile (256–1088px
+for the VAE, 256–3840px for RIFE) — arbitrary width/height within that range needs no rebuild.
+
+The VAE's **frame-count** axis is the exception: Wan's VAE runs a data-dependent chunked
+causal-conv loop internally, so `torch.export` bakes the loop's trip count in as a constant at
+trace time — an engine built for one frame count only ever accepts that frame count. Each distinct
+frame count you actually request gets its own engine, built once and cached from then on, same
+"build on first use" idea as the resolution envelope, just keyed on a dimension that can't be
+folded into one profile. RIFE has no such axis (it always operates on exactly two frames plus one
+interpolation timestep), so this only applies to `vae_rt.py`.
+
+## A known tradeoff, inherited from this project's own prior work
+
+TensorRT-accelerating the VAE is comparatively low-value (cheap next to a full DiT denoise loop)
+and comparatively risky (a from-scratch reimplementation is more likely to have a subtle
+correctness bug than to need the speedup) — a conclusion this project reached before pivoting to
+these two nodes. Every TensorRT call in `vae_rt.py` therefore falls back to eager PyTorch
+(`comfy.sd.VAE`) on failure instead of crashing generation.
+
+## Nodes
+
+| File | Loader | Encode/Decode/Interpolate |
+|---|---|---|
+| `vae_rt.py` | `TensorRTWanVAELoader` (vae filename, precision) | `TensorRTWanVAEEncode` (IMAGE → LATENT), `TensorRTWanVAEDecode` (LATENT → IMAGE) |
+| `rife_rt.py` | `TensorRTRifeLoader` (model, precision) | `TensorRTRifeInterpolate` (IMAGE batch + multiplier → IMAGE batch) |
+
+## Tests
+
+`tests/test_vae_rt.py` / `tests/test_rife_rt.py` exercise only the pure, non-GPU logic (cache
+filenames, envelope bounds, the interpolation frame-pairing loop, checkpoint-exists-vs-download
+branching) via `unittest`, with `tensorrt`/`folder_paths` injected as fakes — no TensorRT/CUDA/
+ComfyUI install required to run them:
 
 ```bash
-pip install -e ".[dev]"          # core + dev tooling
-pip install -e ".[tensorrt]"     # + TensorRT / onnxruntime-gpu (requires an NVIDIA GPU + CUDA)
+python -m unittest tests.test_vae_rt tests.test_rife_rt -v
 ```
 
-See [docs/installation.md](docs/installation.md) for GPU/driver/TensorRT version requirements.
-
-## Quickstart (standalone Python API)
-
-```python
-from tensorrt_wan import WanEngine
-
-engine = WanEngine.from_pretrained("Wan2.1-T2V-14B", precision="auto")
-video = engine.generate(prompt="a fox running through snow", num_frames=81, resolution=(480, 832))
-video.save("out.mp4")
-```
-
-See [docs/python_api.md](docs/python_api.md).
-
-## ComfyUI
-
-Copy or symlink `comfyui/` into `ComfyUI/custom_nodes/tensorrt_wan_comfyui` (avoid naming the
-folder `tensorrt_wan` — that would collide with the pip-installed `tensorrt_wan` package these
-nodes import). See [docs/comfyui_integration.md](docs/comfyui_integration.md) for node reference
-and workflow migration.
-
-## CLI
-
-```bash
-trtwan gpu-report                              # detect GPU + supported precisions
-trtwan export onnx --model wan2.1-t2v-14b      # PyTorch -> ONNX
-trtwan build engine --onnx dit.onnx --profile 480x832   # ONNX -> TensorRT
-trtwan cache list / trtwan cache clear
-```
-
-See [docs/export.md](docs/export.md) and [docs/engine_generation.md](docs/engine_generation.md).
-
-## Development status
-
-This repository is being built in a structure-first phase: interfaces, module boundaries, exporters,
-plugin scaffolding, CLI, ComfyUI nodes, and tests exist, but **no model has been exported, no TensorRT
-engine has been built, and no inference has been executed or profiled in this environment.** That
-validation happens on GPU-equipped hardware (see [docs/roadmap.md](docs/roadmap.md)). Expect
-`NotImplementedError` at the PyTorch→ONNX→TensorRT boundary until that phase.
-
-## Repository layout
-
-| Path | Purpose |
-|---|---|
-| `tensorrt_wan/runtime` | GPU/TensorRT capability detection, precision selection, engine cache, fallback |
-| `tensorrt_wan/conditioning` | Unified conditioning manager (text/image/control/adapter/LoRA/future) |
-| `tensorrt_wan/scheduler` | GPU-resident diffusion scheduler state |
-| `tensorrt_wan/engine` | Text encoder, unified DiT, VAE encoder/decoder TensorRT engine wrappers |
-| `tensorrt_wan/export` | torch.export → ONNX → TensorRT exporters |
-| `tensorrt_wan/plugins` | TensorRT plugin registry + CUDA/C++ plugin sources |
-| `tensorrt_wan/config` | JSON/YAML configuration schema + loader |
-| `tensorrt_wan/api` | Standalone `WanEngine` Python API |
-| `tensorrt_wan/cli` | `trtwan` command-line tool |
-| `comfyui/` | ComfyUI custom node package |
-| `tests/` | Unit/structure tests (no GPU required to collect) |
-| `examples/` | Example scripts (Python API + ComfyUI workflow JSON) |
-| `docs/` | Architecture, installation, and developer documentation |
-| `scripts/` | Plugin build scripts, env setup (not executed by this repo automatically) |
+Actual engine build + inference correctness needs a GPU and a real ComfyUI install to verify.
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE). Contributions welcome, see [docs/contributing.md](docs/contributing.md).
+Apache 2.0 — see [LICENSE](LICENSE).
