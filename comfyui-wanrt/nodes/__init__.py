@@ -1,6 +1,6 @@
-from . import rife_rt, vae_rt
+from . import rife_rt, tensorrt_perf, vae_rt
 
-_MODULES = (vae_rt, rife_rt)
+_MODULES = (vae_rt, rife_rt, tensorrt_perf)
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}

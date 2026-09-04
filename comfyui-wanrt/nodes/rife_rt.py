@@ -196,6 +196,15 @@ class _TensorRTRunner:
         if self._engine is None:
             raise RuntimeError(f"Failed to deserialize TensorRT engine at {self.engine_path}")
         self._context = self._engine.create_execution_context()
+        if self._context is None:
+            # Returns None rather than raising on failure (e.g. CUDA OOM sizing scratch for this
+            # engine's profile) -- without this check that's silently swallowed and only surfaces
+            # later as a misleading "Engine not loaded" from .infer(). See vae_rt.py's identical
+            # fix for the real bug this was confirmed against.
+            raise RuntimeError(
+                f"create_execution_context() returned None for {self.engine_path} -- see "
+                "TensorRT's own [TRT][E] log lines just above this for the real reason."
+            )
         self._stream = torch.cuda.Stream(device=self.device)
 
     def infer(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -292,6 +301,10 @@ def _interpolate_batch(
     """`frames`: (N, 3, H, W) in [0, 1]. Inserts `multiplier - 1` interpolated frames between each
     adjacent input pair (RIFE's timestep input accepts any value in (0, 1), so each intermediate
     frame is generated directly at `k / multiplier` rather than via recursive bisection)."""
+    # ComfyUI hands IMAGE tensors over on CPU; runtime.infer_pair()'s output always lands on
+    # runtime.device (see _TensorRTRunner.infer). Without this, torch.cat below mixes CPU slices
+    # of `frames` with CUDA inference output and fails -- confirmed via a real run.
+    frames = frames.to(runtime.device)
     n = frames.shape[0]
     out = [frames[0:1]]
     for i in range(n - 1):
@@ -318,6 +331,9 @@ def _resample_fps(
     timestep that lands on -- the ratio target_fps/source_fps is rarely an integer, so a fixed
     per-gap frame count can't hit arbitrary target rates (16fps -> 25fps needs a different number
     of inserted frames in different gaps, not a constant one)."""
+    # Same device fix as _interpolate_batch: runtime.infer_pair()'s output always lands on
+    # runtime.device, but `frames` arrives from ComfyUI on CPU.
+    frames = frames.to(runtime.device)
     n = frames.shape[0]
     if n < 2 or source_fps <= 0 or target_fps <= 0:
         return frames

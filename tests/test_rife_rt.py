@@ -39,6 +39,7 @@ class _StubRuntime:
 
     def __init__(self):
         self.calls: list[tuple[float, float]] = []
+        self.device = torch.device("cpu")
 
     def infer_pair(self, frame_0: torch.Tensor, frame_1: torch.Tensor, timestep: float) -> torch.Tensor:
         self.calls.append((float(frame_0[0, 0, 0, 0]), timestep))

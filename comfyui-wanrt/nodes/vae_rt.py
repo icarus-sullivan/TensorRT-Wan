@@ -66,16 +66,36 @@ VAE_SOURCES: dict[str, dict[str, Any]] = {
     },
 }
 
-# Pixel-space (encoder) and latent-space (decoder) H/W envelopes. Narrower than a naive "as wide
-# as possible" choice on purpose: a wider range (tried [256, 1280]px) previously OOM'd (~100GB) at
-# TensorRT execution-context creation time -- the context sizes scratch memory for the profile's
-# worst-case bound, not the actual runtime shape. [256, 1088]px / [32, 136]-latent covers both real
-# target shapes (480x832, 720x1088) and is the confirmed-safe bound. Don't widen without retesting
-# on a GPU.
-ENCODER_HEIGHT = (256, 480, 1088)  # (min, opt, max), pixels
-ENCODER_WIDTH = (256, 832, 1088)
-DECODER_LATENT_HEIGHT = (32, 60, 136)
-DECODER_LATENT_WIDTH = (32, 104, 136)
+# Pixel-space (encoder) and latent-space (decoder) H/W envelopes. NOT mimicking rife_rt.py's much
+# wider [256, 3840] envelope here -- confirmed real finding against this specific VAE architecture
+# (not RIFE's, which never showed this): a [256, 1280]px profile previously OOM'd (~100GB) at
+# TensorRT execution-context creation time (the context sizes scratch for the profile's worst-case
+# bound, not the actual runtime shape). [256, 1536]px / [32, 192]-latent is a deliberate middle
+# ground -- wide enough to cover a real observed target (a 720x1280 portrait generation, latent
+# shape [1,16,21,160,90]) with margin, without jumping straight to RIFE's magnitude for an
+# architecture that already OOM'd at less than half of it. Retest on a GPU before widening further;
+# narrow back toward 1088/136 (the previously-confirmed-safe bound) if this OOMs.
+ENCODER_HEIGHT = (256, 832, 1536)  # (min, opt, max), pixels
+ENCODER_WIDTH = (256, 832, 1536)
+DECODER_LATENT_HEIGHT = (32, 104, 192)
+DECODER_LATENT_WIDTH = (32, 104, 192)
+
+# Experimental, unverified: a full-length decode (e.g. T=21) fuses its unrolled per-frame causal-
+# conv loop into one TensorRT "ForeignNode" whose builder-time tactic search has been confirmed
+# (real error, this session, on this exact GPU) to demand ~100GB and fail -- a documented,
+# currently-unresolved TensorRT/Myelin gap for fused Conv3D on Blackwell (sm_120), not something
+# a profile-bound or builder-flag choice controls (see github.com/NVIDIA/TensorRT issues #4715,
+# #4736, #4743). Decoding in <=DECODER_CHUNK_FRAMES-frame pieces keeps each individual export's
+# unrolled loop small, which may (unverified -- that's the experiment) avoid the fusion size that
+# triggers it. DECODER_CHUNK_OVERLAP re-decodes that many trailing frames of causal "warm-up"
+# context at the start of every chunk after the first and discards the corresponding output
+# prefix, rather than starting each chunk with zero context -- reduces but does not guarantee
+# eliminating visible seams at chunk boundaries, since this project has no verified access to
+# WanVAE's true causal receptive field width. Visually check chunk boundaries (every
+# ~DECODER_CHUNK_FRAMES-DECODER_CHUNK_OVERLAP frames) for flicker/discontinuity before trusting
+# output produced this way.
+DECODER_CHUNK_FRAMES = 9
+DECODER_CHUNK_OVERLAP = 4
 
 DEFAULT_PRECISION = "fp16"
 _DTYPES = {"fp16": torch.float16, "fp32": torch.float32}
@@ -387,11 +407,26 @@ def _build_trt_engine(
     engine_path.write_bytes(serialized)
 
 
-def _engine_filename(component: str, checkpoint_name: str, precision: str, frames: int) -> str:
+def _engine_filename(
+    component: str,
+    checkpoint_name: str,
+    precision: str,
+    frames: int,
+    profile_shapes: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]],
+) -> str:
+    """`profile_shapes` (the min/opt/max shapes actually baked into the built engine) must be part
+    of the cache key -- confirmed as a real gap: without it, changing ENCODER_HEIGHT/WIDTH or
+    DECODER_LATENT_HEIGHT/WIDTH above wouldn't invalidate an already-cached engine built under the
+    old, narrower bounds. Same component/checkpoint/precision/frames/trt-version would hash
+    identically and silently keep serving the stale engine, which then fails `set_input_shape` (or
+    worse, quietly stays within old-but-now-wrong bounds) at the new bounds' runtime shapes."""
     trt = _require_tensorrt()
 
     stem = checkpoint_name.rsplit(".", 1)[0]
-    raw = f"{component}|{checkpoint_name}|{precision}|frames={frames}|trt={trt.__version__}"
+    raw = (
+        f"{component}|{checkpoint_name}|{precision}|frames={frames}|profile={profile_shapes}|"
+        f"trt={trt.__version__}"
+    )
     digest = hashlib.sha256(raw.encode()).hexdigest()[:16]
     return f"{component}_{stem}_{precision}_t{frames}_{digest}.engine"
 
@@ -434,7 +469,32 @@ class _TensorRTRunner:
         if self._engine is None:
             raise RuntimeError(f"Failed to deserialize TensorRT engine at {self.engine_path}")
         self._context = self._engine.create_execution_context()
+        if self._context is None:
+            # create_execution_context() returns None rather than raising on failure (e.g. a CUDA
+            # OOM reserving scratch sized for the engine's optimization profile) -- confirmed as a
+            # real bug via a real run: without this check, that failure was silently swallowed and
+            # only surfaced later as a misleading "Engine not loaded; call .load() first" from
+            # .infer(), masking the actual cause (visible only in TensorRT's own [TRT][E] log
+            # lines immediately above, which this exception can't recover, only point back to).
+            raise RuntimeError(
+                f"create_execution_context() returned None for {self.engine_path} -- see "
+                "TensorRT's own [TRT][E] log lines just above this for the real reason (most "
+                "likely a CUDA out-of-memory error sizing scratch for this engine's optimization "
+                "profile's worst-case bound)."
+            )
         self._stream = torch.cuda.Stream(device=self.device)
+
+    def unload(self) -> None:
+        """Drop this runner's engine/context/stream so their GPU memory can be reclaimed. Needed
+        because `_VAERuntime._get_or_build` keeps loaded runners cached for reuse across calls --
+        without an explicit unload, switching between distinct frame counts (as chunked decode
+        does) would keep every execution context ever loaded alive simultaneously, each sized for
+        the same wide profile's worst-case bound. Confirmed as a real OOM via a real run: two
+        chunk sizes' contexts held concurrently exceeded available GPU memory even though neither
+        alone would have."""
+        self._context = None
+        self._engine = None
+        self._stream = None
 
     def infer(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         context, engine, stream = self._context, self._engine, self._stream
@@ -484,6 +544,7 @@ class _VAERuntime:
         self.device = torch.device("cuda")
         self.model: torch.nn.Module | None = None
         self._runners: dict[tuple[str, int], _TensorRTRunner] = {}
+        self._temporal_upsample: tuple[int, int] | None = None
 
     def _ensure_model(self) -> torch.nn.Module:
         if self.model is None:
@@ -512,7 +573,20 @@ class _VAERuntime:
         if key in self._runners:
             return self._runners[key]
 
-        engine_path = self._cache_dir() / _engine_filename(component, self.checkpoint_name, self.precision, frames)
+        # Evict any other loaded runner(s) for this same component before loading a new one.
+        # Each holds its own execution context sized for this component's profile worst-case
+        # bound, and keeping more than one alive at once was confirmed as a real OOM (2026-08-13):
+        # chunked decode needs two distinct frame counts (the common chunk size + a tail
+        # remainder), and holding both contexts concurrently exceeded available GPU memory even
+        # though neither alone did. Costs a reload (not a rebuild -- the .engine file stays cached
+        # on disk) if that other frame count is needed again later.
+        for other_key in [k for k in self._runners if k[0] == component]:
+            self._runners.pop(other_key).unload()
+        torch.cuda.empty_cache()
+
+        engine_path = self._cache_dir() / _engine_filename(
+            component, self.checkpoint_name, self.precision, frames, profile_shapes
+        )
         if not engine_path.exists():
             # Cache-miss only: torch.export + the TensorRT builder's tactic search is the single
             # heaviest GPU allocation this file makes, easily enough on its own to OOM alongside a
@@ -550,24 +624,79 @@ class _VAERuntime:
             with torch.no_grad():
                 return self._ensure_model().encode(pixels.to(self.device, dtype=self.dtype))
 
-    def decode(self, latent: torch.Tensor) -> torch.Tensor:
-        """`latent`: (B, C, T, H, W). Returns pixels (B, 3, T, H*8, W*8) in [-1, 1]."""
-        frames = latent.shape[2]
+    def _decoder_profile_shapes(self, frames: int, channels: int):
         h_min, h_opt, h_max = DECODER_LATENT_HEIGHT
         w_min, w_opt, w_max = DECODER_LATENT_WIDTH
-        channels = VAE_SOURCES.get(self.checkpoint_name, {}).get("latent_channels", latent.shape[1])
         example = torch.zeros(1, channels, frames, h_opt, w_opt, device=self.device, dtype=self.dtype)
         profile_shapes = (
             (1, channels, frames, h_min, w_min),
             (1, channels, frames, h_opt, w_opt),
             (1, channels, frames, h_max, w_max),
         )
+        return example, profile_shapes
+
+    def _decode_chunk_trt(self, latent: torch.Tensor) -> torch.Tensor:
+        """One TensorRT decode call for a single chunk (no internal fallback -- exceptions
+        propagate to `decode()`'s caller, which falls back to one full-sequence eager decode)."""
+        frames, channels = latent.shape[2], latent.shape[1]
+        example, profile_shapes = self._decoder_profile_shapes(frames, channels)
+        runner = self._get_or_build(
+            "vae_decoder", _VAEDecodeWrapper, "latent", "pixels", example, {3: None, 4: None},
+            profile_shapes, frames,
+        )
+        return runner.infer({"latent": latent})["pixels"]
+
+    def _calibrate_temporal_upsample(self) -> tuple[int, int]:
+        """Empirically determine WanVAE.decode's latent-frame -> pixel-frame relationship
+        (pixel_frames = a*latent_frames + b) via two tiny eager decodes, rather than hardcoding a
+        formula never verified against the real model source. Cached after first call. Self-check
+        against this project's own known fact (81 pixel frames <-> 21 latent frames): a=4, b=-3
+        gives 4*21-3=81 -- matches. Used only by `_decode_chunked_trt` to convert
+        DECODER_CHUNK_OVERLAP latent frames into a pixel-frame count to trim."""
+        if self._temporal_upsample is not None:
+            return self._temporal_upsample
+        model = self._ensure_model()
+        channels = VAE_SOURCES.get(self.checkpoint_name, {}).get("latent_channels", 16)
+        size = DECODER_LATENT_HEIGHT[0]  # smallest already-verified-valid spatial size
+        with torch.no_grad():
+            t1 = model.decode(torch.zeros(1, channels, 1, size, size, device=self.device, dtype=self.dtype)).shape[2]
+            t2 = model.decode(torch.zeros(1, channels, 2, size, size, device=self.device, dtype=self.dtype)).shape[2]
+        a = t2 - t1
+        b = t1 - a
+        self._temporal_upsample = (a, b)
+        return self._temporal_upsample
+
+    def _decode_chunked_trt(self, latent: torch.Tensor) -> torch.Tensor:
+        """Experimental (see DECODER_CHUNK_FRAMES/OVERLAP's module-level comment): decode a long
+        latent sequence as a series of <=DECODER_CHUNK_FRAMES-frame TensorRT calls instead of one
+        call for the whole sequence. Pure TensorRT -- any failure raises, letting `decode()` fall
+        back to one full-sequence eager decode rather than mixing chunked-eager (which would carry
+        the same seam risk into a path that doesn't otherwise have it)."""
+        frames = latent.shape[2]
+        a, b = self._calibrate_temporal_upsample()
+        overlap_pixel_frames = a * DECODER_CHUNK_OVERLAP + b
+
+        outputs = []
+        start = 0
+        first = True
+        while start < frames:
+            chunk_start = start if first else max(0, start - DECODER_CHUNK_OVERLAP)
+            chunk_end = min(chunk_start + DECODER_CHUNK_FRAMES, frames)
+            pixels = self._decode_chunk_trt(latent[:, :, chunk_start:chunk_end])
+            if not first:
+                pixels = pixels[:, :, overlap_pixel_frames:]
+            outputs.append(pixels)
+            first = False
+            start = chunk_end
+        return torch.cat(outputs, dim=2)
+
+    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        """`latent`: (B, C, T, H, W). Returns pixels (B, 3, T, H*8, W*8) in [-1, 1]."""
+        frames = latent.shape[2]
         try:
-            runner = self._get_or_build(
-                "vae_decoder", _VAEDecodeWrapper, "latent", "pixels", example, {3: None, 4: None},
-                profile_shapes, frames,
-            )
-            return runner.infer({"latent": latent})["pixels"]
+            if frames > DECODER_CHUNK_FRAMES:
+                return self._decode_chunked_trt(latent)
+            return self._decode_chunk_trt(latent)
         except Exception as exc:  # noqa: BLE001
             print(f"[TensorRT-RT VAE] decode via TensorRT failed ({exc}); falling back to eager PyTorch.")
             with torch.no_grad():
