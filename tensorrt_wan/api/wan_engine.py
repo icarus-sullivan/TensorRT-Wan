@@ -19,6 +19,7 @@ from tensorrt_wan.conditioning.manager import ConditioningManager
 from tensorrt_wan.conditioning.sources import ImageConditioningSource, TextConditioningSource
 from tensorrt_wan.conditioning.types import ConditioningKind, UnifiedConditioning
 from tensorrt_wan.engine.dit_engine import DiTEngine
+from tensorrt_wan.engine.migraphx_engine import MIGraphXEngineWrapper
 from tensorrt_wan.engine.text_encoder_engine import TextEncoderEngine
 from tensorrt_wan.engine.vae_engine import VAEDecoderEngine, VAEEncoderEngine
 from tensorrt_wan.runtime.manager import RuntimeManager
@@ -64,6 +65,35 @@ def _wan_latent_process_out(latent: torch.Tensor) -> torch.Tensor:
     mean = _WAN21_LATENTS_MEAN.to(latent.device, latent.dtype)
     std = _WAN21_LATENTS_STD.to(latent.device, latent.dtype)
     return latent * std + mean
+
+
+def _load_dit_expert(
+    model_dir: Path, stub: str, device: torch.device, backend: str, *, required: bool = True
+) -> DiTEngine | None:
+    """Construct one MoE expert's `DiTEngine`, picking the file extension and wrapper type for
+    `backend` (`"tensorrt"` -> `{stub}.engine` via the default `TensorRTEngineWrapper`;
+    `"migraphx"` -> `{stub}.onnx` via `MIGraphXEngineWrapper`, see runtime/manager.py's
+    `_resolve_backend` for how `backend` itself is chosen). `stub="dit_high_noise"` also accepts
+    the legacy single-expert `dit.{engine,onnx}` filename as a fallback, preferring the MoE name
+    if both happen to exist.
+
+    `required=False` (only ever passed for `dit_low_noise`) returns `None` instead of
+    constructing anything when the file doesn't exist yet — single-expert mode is a supported
+    (if degraded) fallback, see the `from_pretrained` docstring. `required=True` matches this
+    function's pre-existing behavior of not checking existence at all: same as
+    `TensorRTEngineWrapper`, a missing file surfaces as a clear `FileNotFoundError` from
+    `.load()` at actual use time, not eagerly here.
+    """
+    extension = "onnx" if backend == "migraphx" else "engine"
+    path = model_dir / f"{stub}.{extension}"
+    if not path.exists() and stub == "dit_high_noise":
+        path = model_dir / f"dit.{extension}"
+    if required is False and not path.exists():
+        return None
+
+    if backend == "migraphx":
+        return DiTEngine(path, device=device, wrapper=MIGraphXEngineWrapper(path, device=device))
+    return DiTEngine(path, device=device)
 
 
 class WanEngine:
@@ -145,16 +175,12 @@ class WanEngine:
 
         tokenizer = tokenizer or load_default_tokenizer(config.tokenizer_name, config.max_text_tokens)
 
+        # Text encoder / VAE stay TensorRT-only for now -- no ROCm hardware here to validate
+        # against, and the DiT (50-100 forward passes/generation) dominates cost far more than
+        # either, so it's the one component worth the MIGraphX build effort. See docs/rocm_setup.md.
         text_encoder = TextEncoderEngine(model_dir / "text_encoder.engine", tokenizer, device=device)
-        # "dit_high_noise.engine" is the real MoE filename; "dit.engine" is accepted as a
-        # single-expert fallback for any `model_dir` assembled before MoE support existed. Prefers
-        # the former if both happen to be present.
-        high_noise_path = model_dir / "dit_high_noise.engine"
-        if not high_noise_path.exists():
-            high_noise_path = model_dir / "dit.engine"
-        dit_high_noise = DiTEngine(high_noise_path, device=device)
-        low_noise_path = model_dir / "dit_low_noise.engine"
-        dit_low_noise = DiTEngine(low_noise_path, device=device) if low_noise_path.exists() else None
+        dit_high_noise = _load_dit_expert(model_dir, "dit_high_noise", device, runtime.backend)
+        dit_low_noise = _load_dit_expert(model_dir, "dit_low_noise", device, runtime.backend, required=False)
         if dit_low_noise is None:
             logger.warning(
                 "No dit_low_noise.engine found in %s -- running the entire denoising schedule on "

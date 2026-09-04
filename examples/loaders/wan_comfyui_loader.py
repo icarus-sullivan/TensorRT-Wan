@@ -186,6 +186,55 @@ def _decompose_attention_for_export() -> None:
     torch.nn.functional.scaled_dot_product_attention = _decomposed_sdpa
 
 
+def _decomposed_rms_norm(
+    input: torch.Tensor,
+    normalized_shape,
+    weight: torch.Tensor | None = None,
+    eps: float | None = None,
+) -> torch.Tensor:
+    """Reference (mean-of-squares + rsqrt + scale) RMSNorm — the same decomposition
+    `torch.nn.functional.rms_norm`'s own docs give as its defining math, expressed in plain
+    ReduceMean/Mul/Sqrt/Div-class ops instead of the fused `RMSNormalization` op ONNX only added
+    at opset 23.
+
+    Needed for a MIGraphX-targeted export (see `_decompose_rms_norm_for_export`): AMD's MIGraphX
+    caps out at ONNX opset 19 (confirmed against AMD's own ROCm/AMDMIGraphX supported-ops docs,
+    2026-09) and doesn't list `RMSNormalization` as a supported op at all, so a native-op DiT
+    graph simply won't parse there. Wan's `WanSelfAttention.norm_q`/`norm_k`
+    (`comfy.ldm.wan.model`, via `comfy.ops`'s `RMSNorm`, itself a `torch.nn.RMSNorm` subclass)
+    both bottom out in `torch.nn.functional.rms_norm` regardless of the `comfy_cast_weights`
+    branch taken — same one-function monkeypatch shape as `_decompose_attention_for_export`
+    below.
+
+    Deliberately does *not* force an internal fp32 upcast the way some RMSNorm implementations
+    do for numerical stability — matches this file's existing decomposed ops (`_decomposed_sdpa`
+    computes in whatever dtype its inputs already are). Unverified against real gfx1103 hardware;
+    if a real MIGraphX build shows precision drift here, that upcast is the first thing to try —
+    see docs/rocm_setup.md.
+    """
+    if isinstance(normalized_shape, int):
+        normalized_shape = (normalized_shape,)
+    if eps is None:
+        eps = torch.finfo(input.dtype).eps
+    dims = tuple(range(-len(normalized_shape), 0))
+    variance = input.pow(2).mean(dim=dims, keepdim=True)
+    out = input * torch.rsqrt(variance + eps)
+    if weight is not None:
+        out = out * weight
+    return out
+
+
+def _decompose_rms_norm_for_export() -> None:
+    """Monkeypatch `torch.nn.functional.rms_norm` to `_decomposed_rms_norm` for the duration of
+    this process. Only called for a MIGraphX-targeted export (`TRTWAN_EXPORT_TARGET=migraphx`,
+    see `load_dit`) — the TensorRT path wants the real opset-23 `RMSNormalization` op, which
+    TensorRT itself has no problem with (this decomposition exists for MIGraphX's opset-19 cap,
+    not a TensorRT correctness issue the way `_decompose_attention_for_export` was). Only affects
+    this process, not a running ComfyUI server, same reasoning as every other monkeypatch here.
+    """
+    torch.nn.functional.rms_norm = _decomposed_rms_norm
+
+
 def _add_comfyui_to_path() -> None:
     """ComfyUI isn't a pip-installed package — its `comfy` module only imports if ComfyUI's own
     repo root is on sys.path. Set COMFYUI_ROOT, or this defaults to the path this loader was
@@ -224,9 +273,17 @@ def load_dit(checkpoint_path: str) -> torch.nn.Module:
     tuning choice for the DiT, it's the difference between a working and a silently-broken engine
     — an env var flip should not be able to reintroduce that failure mode without at least a loud
     warning.
+
+    `TRTWAN_EXPORT_TARGET` (default `tensorrt`) selects which downstream builder this export is
+    for. `migraphx` additionally decomposes RMSNorm (`_decompose_rms_norm_for_export`) — AMD's
+    MIGraphX caps out at ONNX opset 19 and has no native `RMSNormalization` op (opset 23), unlike
+    TensorRT, which has no problem with it — see that function's docstring. `export/base.py`'s
+    `ModelExporter.opset_version` reads the same env var to pick the matching opset.
     """
     _add_comfyui_to_path()
     _decompose_attention_for_export()
+    if os.environ.get("TRTWAN_EXPORT_TARGET", "tensorrt") == "migraphx":
+        _decompose_rms_norm_for_export()
 
     import comfy.ldm.wan.model as wan_model  # noqa: E402
     import comfy.sd  # noqa: E402

@@ -24,6 +24,12 @@ _ARCHITECTURE_MAX_PRECISION: dict[GPUArchitecture, str] = {
     GPUArchitecture.VOLTA: "fp16",
     GPUArchitecture.PASCAL: "fp32",
     GPUArchitecture.UNKNOWN: "fp16",
+    # gfx1103 (RDNA3) and unclassified AMD targets have no FP8 support and no confirmed-safe
+    # precision ceiling above fp16 on this project's hardware (see docs/rocm_setup.md) — the DiT's
+    # own MIGraphX build path selects bf16 independently of this table (see export/base.py's
+    # opset-override docstring), matching the NVIDIA path's existing bf16-not-fp16 DiT requirement.
+    GPUArchitecture.AMD_RDNA3: "fp16",
+    GPUArchitecture.AMD_UNKNOWN: "fp16",
 }
 
 

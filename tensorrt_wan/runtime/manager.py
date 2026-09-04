@@ -12,17 +12,32 @@ from dataclasses import dataclass, field
 from tensorrt_wan.config.schema import TensorRTWanConfig
 from tensorrt_wan.runtime.cache import EngineCache
 from tensorrt_wan.runtime.capability import TensorRTCapability, detect_tensorrt
-from tensorrt_wan.runtime.gpu import GPUInfo, detect_gpus
+from tensorrt_wan.runtime.gpu import GPUInfo, detect_gpus, is_rocm_available
 from tensorrt_wan.runtime.precision import PrecisionDecision, select_precision
 from tensorrt_wan.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
+def _resolve_backend(gpus: list[GPUInfo], tensorrt: TensorRTCapability) -> str:
+    """Which engine backend this process should build/load against: `"migraphx"` when TensorRT
+    isn't available and at least one detected GPU is a ROCm/AMD device, `"tensorrt"` otherwise.
+
+    TensorRT has no ROCm build at all (see docs/rocm_setup.md) -- on AMD hardware there is
+    nothing else to fall back to, so this doesn't try to be cleverer than a two-way switch.
+    Neither-available (no GPU, or an NVIDIA GPU with no TensorRT installed) still resolves to
+    `"tensorrt"` — existing NVIDIA-only error paths (e.g. `gpu.require_gpu()`) apply unchanged.
+    """
+    if not tensorrt.available and is_rocm_available():
+        return "migraphx"
+    return "tensorrt"
+
+
 @dataclass
 class DiagnosticsReport:
     gpus: list[GPUInfo]
     tensorrt: TensorRTCapability
+    backend: str
     precision: PrecisionDecision | None
     loaded_plugins: list[str]
     cache_entries: int
@@ -42,6 +57,7 @@ class DiagnosticsReport:
                 f"  FP8={self.tensorrt.supports_fp8} BF16={self.tensorrt.supports_bf16} "
                 f"strongly_typed={self.tensorrt.supports_strongly_typed}"
             )
+        lines.append(f"Backend: {self.backend}")
         if self.precision is not None:
             lines.append(f"Selected precision: {self.precision.precision} ({self.precision.reason})")
         lines.append(f"Loaded plugins: {', '.join(self.loaded_plugins) or '(none)'}")
@@ -61,6 +77,7 @@ class RuntimeManager:
         self.config = config or TensorRTWanConfig()
         self.gpus: list[GPUInfo] = detect_gpus()
         self.tensorrt: TensorRTCapability = detect_tensorrt()
+        self.backend: str = _resolve_backend(self.gpus, self.tensorrt)
         self.cache = EngineCache(self.config.cache.directory, enabled=self.config.cache.enabled)
         self._loaded_plugins: list[str] = []
         self._loaded_engines: dict[str, object] = {}
@@ -107,6 +124,7 @@ class RuntimeManager:
         return DiagnosticsReport(
             gpus=self.gpus,
             tensorrt=self.tensorrt,
+            backend=self.backend,
             precision=precision,
             loaded_plugins=list(self._loaded_plugins),
             cache_entries=len(self.cache.list()),

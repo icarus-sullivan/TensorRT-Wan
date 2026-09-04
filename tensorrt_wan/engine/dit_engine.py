@@ -67,9 +67,22 @@ class DiTEngine:
         *,
         device: torch.device | None = None,
         torch_fallback: torch.nn.Module | None = None,
+        wrapper: object | None = None,
     ) -> None:
+        """`wrapper`, if given, replaces the default `TensorRTEngineWrapper` entirely (and
+        `engine_path`/`torch_fallback` are then ignored — the wrapper already has its own
+        engine/program path). Duck-typed to any object exposing `.load()`, `.unload()`, and
+        `.infer(dict[str, Tensor]) -> dict[str, Tensor]` — no shared base class, since the two
+        real implementations' construction-time concerns (TensorRT's LoRA refit/optimization
+        profiles vs MIGraphX's fixed-shape static program) are genuinely different, not just an
+        implementation detail. This is what lets `engine/migraphx_engine.py`'s
+        `MIGraphXEngineWrapper` reuse every bit of this class's conditioning-assembly logic
+        below (`_build_inputs`/`_concat_image_conditioning`/`_null_conditioning`) instead of
+        duplicating ~200 lines of hard-won, bug-fixed conditioning code into a second engine
+        class — see docs/rocm_setup.md.
+        """
         self.device = device or torch.device("cuda")
-        self._wrapper = TensorRTEngineWrapper(engine_path, device=self.device, torch_fallback=torch_fallback)
+        self._wrapper = wrapper or TensorRTEngineWrapper(engine_path, device=self.device, torch_fallback=torch_fallback)
 
     def load(self) -> None:
         self._wrapper.load()

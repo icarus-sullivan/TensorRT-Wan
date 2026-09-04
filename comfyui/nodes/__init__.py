@@ -3,11 +3,13 @@ from . import (
     conditioning_manager,
     diagnostics,
     dit_loader,
+    dit_loader_migraphx,
     engine_builder,
     engine_inspector,
     loader,
     lora_loader,
     precision_selector,
+    resolution_profile,
     runtime_manager,
     sampler,
     scheduler,
@@ -21,6 +23,7 @@ _MODULES = (
     precision_selector,
     loader,
     dit_loader,  # recommended path for a real ComfyUI workflow -- see dit_loader.py's docstring
+    dit_loader_migraphx,  # AMD/ROCm counterpart -- no TensorRT on that hardware, see docs/rocm_setup.md
     lora_loader,  # LoRA application for TensorRTDiTLoader models -- see lora_loader.py's docstring
     engine_builder,
     text_encoder,
@@ -32,6 +35,7 @@ _MODULES = (
     cache_manager,
     diagnostics,
     engine_inspector,
+    resolution_profile,
 )
 
 NODE_CLASS_MAPPINGS = {}

@@ -141,4 +141,13 @@ class ModelExporter(ABC):
         # a real ONNX export attempt failing at opset 20 with "No ONNX function found for
         # aten._fused_rms_norm" — see docs/wan2.2_i2v_14b_notes.md. Below opset 23, exporting any
         # Wan component that uses RMSNorm fails outright, not just degrades.
+        #
+        # TRTWAN_EXPORT_TARGET=migraphx (see examples/loaders/wan_comfyui_loader.py's `load_dit`)
+        # caps this at 19 instead: AMD's MIGraphX supports ONNX operators only up to opset 19
+        # (confirmed against AMD's own ROCm/AMDMIGraphX docs, 2026-09) and doesn't support opset
+        # 23's native RMSNormalization or Attention ops at all. That loader already monkeypatches
+        # RMSNorm down to opset-<19 primitives for this target — see
+        # `_decompose_rms_norm_for_export` — so opset 23 is no longer needed on that path.
+        if os.environ.get("TRTWAN_EXPORT_TARGET", "tensorrt") == "migraphx":
+            return 19
         return 23

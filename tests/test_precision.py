@@ -34,3 +34,13 @@ def test_explicit_mode_overrides_auto_selection():
     decision = select_precision(_gpu(GPUArchitecture.BLACKWELL), PrecisionConfig(mode="fp16"))
     assert decision.precision == "fp16"
     assert "explicit" in decision.reason
+
+
+def test_amd_rdna3_defaults_to_fp16():
+    decision = select_precision(_gpu(GPUArchitecture.AMD_RDNA3), PrecisionConfig())
+    assert decision.precision == "fp16"
+
+
+def test_amd_unknown_defaults_to_fp16():
+    decision = select_precision(_gpu(GPUArchitecture.AMD_UNKNOWN), PrecisionConfig())
+    assert decision.precision == "fp16"

@@ -46,6 +46,8 @@ DEFAULT_RESOLUTION_PROFILES: tuple[ResolutionProfile, ...] = (
     ResolutionProfile("768x768", 768, 768),
     ResolutionProfile("1024x1024", 1024, 1024),
     ResolutionProfile("1080x1920", 1080, 1920),
+    ResolutionProfile("720x1088", 720, 1088),
+    ResolutionProfile("1088x720", 1088, 720),
 )
 
 

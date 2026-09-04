@@ -31,6 +31,14 @@ class CacheKey:
     gpu_architecture: str
     optimization_profile: str
     precision: str
+    # "tensorrt" (default, preserves every pre-existing cache key's hash) or "migraphx" -- an
+    # ONNX file cached for MIGraphX and one built into a TensorRT engine must never collide even
+    # if every other field happens to match, since they're not remotely the same artifact.
+    # `tensorrt_version`/`cuda_version` are left as-is (not repurposed) for a `migraphx` key --
+    # they'll read "unknown" from that path's caller, which is fine, they're just two more
+    # differentiating fields at that point, not semantically load-bearing the way they are for
+    # a real TensorRT build.
+    backend: str = "tensorrt"
     # Confirmed necessary against a second, real collision: `optimization_profile` is a *name*
     # string (e.g. "480x832"), not the exporter's actual traced shape — two builds of the same
     # component/profile-name but different exporter-kwargs (e.g. VAEEncoderExporter's `frames=1`

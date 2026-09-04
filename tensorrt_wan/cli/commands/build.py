@@ -10,6 +10,7 @@ from tensorrt_wan.cli.loader import resolve_loader
 from tensorrt_wan.cli.runtime_helpers import build_runtime
 from tensorrt_wan.config.schema import DEFAULT_RESOLUTION_PROFILES, ResolutionProfile
 from tensorrt_wan.export.exporters import DiTExporter, TextEncoderExporter, VAEDecoderExporter, VAEEncoderExporter
+from tensorrt_wan.export.migraphx_build import build_migraphx_program
 from tensorrt_wan.export.trt_build import build_tensorrt_engine
 from tensorrt_wan.lora import onnx_weight_name_map, save_weight_name_map, weight_map_path_for_engine
 from tensorrt_wan.runtime.cache import CacheKey
@@ -39,6 +40,19 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--resolutions", default=None, help="Comma-separated profile names from config; default: all configured"
     )
     engine_parser.add_argument("--precision", choices=["auto", "fp8", "fp16", "bf16", "fp32"], default="auto")
+    engine_parser.add_argument(
+        "--backend",
+        choices=["tensorrt", "migraphx"],
+        default="tensorrt",
+        help=(
+            "'migraphx' (AMD/ROCm, no TensorRT -- see docs/rocm_setup.md) validates --onnx "
+            "compiles under MIGraphXExecutionProvider and caches the ONNX file itself, rather "
+            "than building a TensorRT engine -- see export/migraphx_build.py's module "
+            "docstring. Requires --onnx from a 'trtwan export onnx --target migraphx' run and "
+            "exactly one --resolutions profile (a MIGraphX build is single-static-shape, not "
+            "multi-profile like a TensorRT engine -- see DiTExporter's static=True)."
+        ),
+    )
     engine_parser.add_argument("--force", action="store_true", help="Rebuild even if a cached engine matches")
     engine_parser.set_defaults(func=run_engine)
 
@@ -65,9 +79,15 @@ def run_engine(args: argparse.Namespace) -> int:
     runtime.config.precision.mode = args.precision
     gpu = runtime.primary_gpu
     if gpu is None:
-        raise SystemExit("No GPU detected; engine builds require a CUDA-capable device.")
+        raise SystemExit("No GPU detected; engine builds require a CUDA- or ROCm-capable device.")
 
     profiles = _resolve_profiles(runtime, args.resolutions)
+    if args.backend == "migraphx" and len(profiles) != 1:
+        raise SystemExit(
+            f"--backend migraphx builds one static-shape ONNX per resolution (got "
+            f"{len(profiles)} via --resolutions), not a multi-profile engine like TensorRT -- "
+            "pass exactly one --resolutions profile name. See export/migraphx_build.py."
+        )
     precision = runtime.select_precision(gpu.index).precision
     model_hash = hashlib.sha256(Path(args.checkpoint).read_bytes()).hexdigest()[:16] if Path(
         args.checkpoint
@@ -82,24 +102,28 @@ def run_engine(args: argparse.Namespace) -> int:
         optimization_profile=",".join(p.name for p in profiles),
         precision=precision,
         input_shape_digest=exporter.shape_digest(),
+        backend=args.backend,
     )
 
     if not args.force:
         cached = runtime.cache.get(cache_key)
         if cached is not None:
-            print(f"Using cached engine: {cached}")
+            print(f"Using cached {'ONNX file' if args.backend == 'migraphx' else 'engine'}: {cached}")
             return 0
 
-    engine_bytes = build_tensorrt_engine(
-        args.onnx,
-        exporter,
-        profiles,
-        precision,
-        workspace_limit_mb=runtime.config.memory.workspace_limit_mb,
-        timing_cache_path=runtime.cache.directory / "trt_timing_cache.bin",
-    )
+    if args.backend == "migraphx":
+        engine_bytes = build_migraphx_program(args.onnx, precision)
+    else:
+        engine_bytes = build_tensorrt_engine(
+            args.onnx,
+            exporter,
+            profiles,
+            precision,
+            workspace_limit_mb=runtime.config.memory.workspace_limit_mb,
+            timing_cache_path=runtime.cache.directory / "trt_timing_cache.bin",
+        )
     engine_path = runtime.cache.put(cache_key, engine_bytes)
-    print(f"Built {args.component} engine -> {engine_path}")
+    print(f"Built {args.component} {'MIGraphX-validated ONNX' if args.backend == 'migraphx' else 'engine'} -> {engine_path}")
 
     # Sidecar survives the onnx file's routine post-build deletion (see
     # docs/wan2.2_i2v_14b_notes.md) -- comfyui/nodes/lora_loader.py needs this mapping at inference

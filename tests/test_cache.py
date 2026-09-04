@@ -78,3 +78,22 @@ def test_disabled_cache_always_misses(tmp_path: Path):
 def test_digest_is_stable_for_equal_keys():
     assert _key().digest() == _key().digest()
     assert _key().digest() != _key(precision="fp8").digest()
+
+
+def test_backend_defaults_to_tensorrt():
+    assert _key().backend == "tensorrt"
+
+
+def test_different_backend_is_a_different_cache_entry():
+    # A MIGraphX-cached ONNX file and a TensorRT-built engine must never collide even if every
+    # other field happens to match -- they're not remotely the same artifact. See CacheKey's
+    # `backend` field docstring.
+    assert _key(backend="tensorrt").digest() != _key(backend="migraphx").digest()
+
+
+def test_migraphx_backend_round_trips(tmp_path: Path):
+    cache = EngineCache(tmp_path)
+    key = _key(backend="migraphx", tensorrt_version="unknown", cuda_version="unknown", gpu_architecture="amd_rdna3")
+    path = cache.put(key, b"fake-onnx-bytes")
+    assert cache.get(key) == path
+    assert path.read_bytes() == b"fake-onnx-bytes"
